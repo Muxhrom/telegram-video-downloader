@@ -3,32 +3,19 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $pythonExe = Join-Path $projectRoot '.venv\Scripts\python.exe'
 $buildTemp = Join-Path $projectRoot 'work\build-temp'
+$setupScript = Join-Path $projectRoot 'scripts\setup.ps1'
+
+Write-Host '预计构建耗时 3–10 分钟，首次安装依赖时可能更久。'
+& $setupScript -Development
+if (-not (Test-Path -LiteralPath $pythonExe)) {
+    throw "依赖安装完成后仍未找到虚拟环境 Python：$pythonExe"
+}
+
 New-Item -ItemType Directory -Path $buildTemp -Force | Out-Null
 $env:TEMP = $buildTemp
 $env:TMP = $buildTemp
 
-if (-not (Test-Path -LiteralPath $pythonExe)) {
-    $pythonLauncher = Get-Command 'py.exe' -ErrorAction SilentlyContinue
-    if ($pythonLauncher) {
-        $systemPython = $pythonLauncher.Source
-        $nativeArgs = @('-3.13', '-m', 'venv', (Join-Path $projectRoot '.venv'))
-    } else {
-        $pythonCommand = Get-Command 'python.exe' -ErrorAction SilentlyContinue
-        if (-not $pythonCommand) {
-            throw '未找到 Python 3.13；请先安装 Python 并确保 py.exe 或 python.exe 可用。'
-        }
-        $systemPython = $pythonCommand.Source
-        $nativeArgs = @('-m', 'venv', (Join-Path $projectRoot '.venv'))
-    }
-    & $systemPython @nativeArgs
-    if ($LASTEXITCODE -ne 0) { throw "创建虚拟环境失败，退出码 $LASTEXITCODE" }
-}
-
-$nativeArgs = @('-m', 'pip', 'install', '-r', (Join-Path $projectRoot 'requirements-dev.txt'))
-& $pythonExe @nativeArgs
-if ($LASTEXITCODE -ne 0) { throw "安装依赖失败，退出码 $LASTEXITCODE" }
-
-$nativeArgs = @(
+$testArgs = @(
     '-m'
     'pytest'
     (Join-Path $projectRoot 'tests')
@@ -39,7 +26,7 @@ $nativeArgs = @(
 )
 Push-Location $projectRoot
 try {
-    & $pythonExe @nativeArgs
+    & $pythonExe @testArgs
     if ($LASTEXITCODE -ne 0) { throw "测试失败，退出码 $LASTEXITCODE" }
 } finally {
     Pop-Location
@@ -48,7 +35,7 @@ try {
 $outputDir = Join-Path $projectRoot 'dist'
 $pyInstallerWork = Join-Path $projectRoot 'work\pyinstaller'
 $pyInstallerSpec = Join-Path $projectRoot 'work\pyinstaller-spec'
-$nativeArgs = @(
+$buildArgs = @(
     '-m'
     'PyInstaller'
     '--onefile'
@@ -67,7 +54,7 @@ $nativeArgs = @(
     "--specpath=$pyInstallerSpec"
     (Join-Path $projectRoot 'run.py')
 )
-& $pythonExe @nativeArgs
+& $pythonExe @buildArgs
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller 构建 EXE 失败，退出码 $LASTEXITCODE" }
 
 $exePath = Join-Path $outputDir 'telegram视频下载器.exe'

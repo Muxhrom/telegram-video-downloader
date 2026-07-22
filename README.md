@@ -1,55 +1,81 @@
 # Telegram 视频下载器
 
-Windows 桌面程序：通过 `SOCKS5 127.0.0.1:7890` 连接 Telegram，浏览群聊/频道历史视频并批量下载；下载完成后可使用 FFmpeg 无损规范容器元数据，并通过本地 OpenList 自动上传到阿里云盘。
+Windows 桌面程序：使用 Telegram 用户账号浏览群聊、超级群组和频道中的历史视频，批量下载并管理队列；可选使用 FFmpeg 无损重封装元数据，再通过本地 OpenList 直连上传到阿里云盘。
 
-运行日志保存在 `%LOCALAPPDATA%\TelegramVideoDownloader\app.log`。主界面右上角的“打开日志”按钮可以直接打开该目录；历史扫描日志会记录媒体筛选器、分页游标、返回数量、限流和超时信息。
+## 功能
 
-“下载管理”窗口集中管理手动下载和自动下载任务，显示单文件进度、实时速度、已下载/总大小、预计剩余时间和保存位置。等待任务支持高、普通、低三级优先级，也可以取消、重试失败任务、清理已完成记录或打开所在目录。
+- Telegram 连接固定使用 SOCKS5 `127.0.0.1:7890`，代理不可用时不会绕过代理直连。
+- 服务端媒体筛选、分页加载、名称/日期筛选，支持普通视频、视频文件和圆形视频。
+- 下载管理窗口提供进度、速度、ETA、优先级、暂停、取消和失败重试。
+- 每个群聊可独立开启新增视频自动下载；历史记录按群聊 ID 和消息 ID 去重。
+- 下载目录同名比对，已存在的视频会在主列表中变灰标注。
+- 上传管理窗口提供 FFmpeg 处理、WebDAV 上传、远端校验和重试。
+- OpenList/阿里云盘通信直接联网，不使用 Telegram 的 Clash 代理。
+- 窗口关闭后留在系统托盘，选择“彻底退出”才停止后台任务。
 
-下载器内置 `cryptg` 本地加解密加速，不会因此增加 Telegram 请求。下载管理窗口还提供可选的“安全加速”：普通模式最多同时下载 2 个文件，开启后最多 3 个。安全加速只提高多个排队视频的总吞吐量，不会把单个视频拆成大量并行分片；遇到 Telegram 限流或连接异常时会自动退回普通模式。
+## 快速开始
 
-程序会在后台递归扫描当前群聊的保存目录。若目录中已有同名视频，主视频列表会将该项目变灰并显示“目录中已存在”；点击“刷新已下载标记”可在外部增删文件后重新比对。
+要求：
 
-“上传管理”窗口显示规范元数据、上传、校验等阶段的进度、速度、剩余时间、优先级和云端路径。上传记录与本地文件是否存在相互独立：手动删除本地视频后，已验证的云端记录仍会保留。
+- Windows 10/11 x64
+- 64 位 Python 3.11、3.12 或 3.13
+- PowerShell 7
+- Clash 或兼容 SOCKS5 代理，监听 `127.0.0.1:7890`
 
-## 阿里云盘设置
-
-1. 打开“云盘设置”，安装并启动程序管理的本地 OpenList。
-2. 点击“打开管理页”，使用窗口中显示的 `admin` 用户名和随机密码登录。
-3. 在 OpenList 的“存储”页面添加“阿里云盘 Open/OAuth2”，挂载路径填写 `aliyun-drive`，按页面提示扫码授权。
-4. 返回程序点击“测试挂载”。成功后，未来下载完成的视频默认自动进入上传队列。
-5. 程序优先使用系统现有 FFmpeg；没有时可点击“自动安装 FFmpeg”，也可以手动选择 `ffmpeg.exe`。
-
-Telegram 连接始终使用 `127.0.0.1:7890`。OpenList 到阿里云盘的上传会清除代理环境并直接连接，不经过 Clash。
-
-OpenList 管理员密码可在云盘设置中自定义、保存并复制，密码存入 Windows 凭据管理器。运行状态和操作错误显示在主界面顶部的自动消失通知条中，避免频繁弹窗。
-
-上传前使用 FFmpeg `-c copy` 保留原始音视频流，仅清理并写入标题、作者和群聊专辑元数据。修改视频元数据规避审查风险。
-
-## 使用前准备
-
-1. 启动 Clash，确认混合端口为 `127.0.0.1:7890`。
-2. 登录 [my.telegram.org](https://my.telegram.org)，在 **API development tools** 创建应用并取得自己的 `api_id` 和 `api_hash`。
-3. 不要把 `api_hash` 或 `%LOCALAPPDATA%\TelegramVideoDownloader\telegram.session` 发给别人。
-
-## 运行源码
-
-在 PowerShell 7 中执行：
+克隆仓库后执行：
 
 ```powershell
 Set-Location -LiteralPath '<项目目录>'
-& '.\.venv\Scripts\python.exe' '.\run.py'
+& '.\scripts\setup.ps1'
+& '.\scripts\run.ps1'
 ```
 
-首次运行时填写 API 信息和手机号，然后输入 Telegram 内收到的验证码；若账号启用了二步验证，还需输入密码。`api_hash` 写入 Windows 凭据管理器，普通设置和下载记录位于 `%LOCALAPPDATA%\TelegramVideoDownloader`。
+`setup.ps1` 会自动寻找受支持的 Python、创建 `.venv` 并安装运行依赖。以后启动只需执行 `scripts\run.ps1`。
 
-## 操作说明
+开发环境与测试：
 
-- 左侧选择群聊或频道；右侧分页载入视频。
-- 可以按名称和日期筛选，然后全选、反选或逐项勾选下载。
-- “自动下载”只监听开关启用后出现的新视频，不补下载此前历史。
-- 关闭主窗口后程序继续在系统托盘运行；从托盘选择“彻底退出”才停止。
-- 程序只读取和下载媒体，不会发送、转发或删除 Telegram 消息。
+```powershell
+& '.\scripts\setup.ps1' -Development
+& '.\scripts\test.ps1'
+```
+
+完整开发接管说明见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)，模块与数据流见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+
+## 首次登录 Telegram
+
+1. 启动 Clash，确认 SOCKS5/混合端口为 `127.0.0.1:7890`。
+2. 登录 [my.telegram.org](https://my.telegram.org)，在 **API development tools** 创建应用并取得自己的 `api_id` 和 `api_hash`。
+3. 启动程序，填写 API 信息和手机号，再输入 Telegram 客户端收到的验证码。
+4. 如果账号启用了二步验证，继续输入二步验证密码。
+
+程序只读取消息和下载媒体，不会发送、转发或删除 Telegram 消息。
+
+## 配置阿里云盘上传
+
+1. 打开“云盘设置”，安装并启动程序管理的本地 OpenList。
+2. 点击“打开管理页”，使用窗口显示的管理员账号和密码登录。
+3. 在 OpenList 的“存储”页面添加“阿里云盘 Open/OAuth2”，挂载路径填写 `aliyun-drive`。
+4. 返回程序点击“测试挂载”。
+5. 选择现有 `ffmpeg.exe`，或使用程序提供的自动安装功能。
+
+上传前 FFmpeg 使用 `-c copy` 保留音视频流，只执行容器与元数据标准化。此功能用于文件整理和兼容性，不用于规避云盘审核。OpenList、FFmpeg 下载和云盘上传默认直接联网；仅 Telegram 使用 `127.0.0.1:7890`。
+
+## 本地数据与隐私
+
+用户数据不保存在仓库或 EXE 旁边：
+
+- 设置、数据库、Telegram 会话和日志：`%LOCALAPPDATA%\TelegramVideoDownloader`
+- 默认视频目录：`%USERPROFILE%\Downloads\Telegram Video Downloader`
+- API Hash 与 OpenList 管理员密码：Windows 凭据管理器
+- 上传临时文件：`%LOCALAPPDATA%\TelegramVideoDownloader\upload_staging`
+
+不要提交或分享 `telegram.session`、`state.sqlite3`、`config.json`、日志、OpenList `data` 目录或下载的视频。更完整的边界说明见 [PRIVACY.md](PRIVACY.md)。
+
+提交前可以运行：
+
+```powershell
+& '.\scripts\check-privacy.ps1'
+```
 
 ## 构建免安装 EXE
 
@@ -57,11 +83,12 @@ Set-Location -LiteralPath '<项目目录>'
 & '.\build.ps1'
 ```
 
-脚本会创建独立虚拟环境、安装锁定依赖、运行测试，并使用 PyInstaller 构建 `dist\telegram视频下载器.exe`。
+脚本会准备开发依赖、运行全部测试并使用 PyInstaller 构建 `dist\telegram视频下载器.exe`。通常耗时 3–10 分钟，首次下载依赖时可能更久。生成的 EXE 和构建缓存均被 Git 忽略。
 
 ## 故障排查
 
-- 提示代理未启动：在 Clash 中确认混合端口确实为 7890，再点“测试代理”或“登录 / 重连”。程序不会绕过代理直连。
-- 收不到验证码：验证码通常发到已登录的 Telegram 客户端，而不一定是短信。
-- Telegram 限流：等待提示要求的时间后重试，不要反复高频扫描大型群聊。
-- 日志文件：`%LOCALAPPDATA%\TelegramVideoDownloader\app.log`。
+- **代理未启动**：确认 Clash 的 SOCKS5/混合端口为 7890，然后点“测试代理”或“登录 / 重连”。
+- **收不到验证码**：验证码通常发送到已登录的 Telegram 客户端，不一定是短信。
+- **Telegram 限流**：按界面提示等待，不要反复高频扫描大型群聊。
+- **OpenList 无法启动**：查看 `%LOCALAPPDATA%\TelegramVideoDownloader\tools\openlist\openlist.log`。
+- **程序运行异常**：查看 `%LOCALAPPDATA%\TelegramVideoDownloader\app.log`。
