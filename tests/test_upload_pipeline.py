@@ -77,6 +77,47 @@ def test_propfind_parses_remote_size_and_etag(tmp_path: Path) -> None:
     assert asyncio.run(scenario()) == {"size": 12345, "etag": "abc"}
 
 
+def test_ensure_directories_does_not_recreate_existing_mount(
+    tmp_path: Path,
+) -> None:
+    paths = make_paths(tmp_path)
+    paths.ensure()
+    worker = UploadWorker(paths, AppConfig())
+    requests: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        if request.method == "PROPFIND":
+            if request.url.path in {"/dav/aliyun-drive", "/dav/aliyun-drive/Telegram"}:
+                return httpx.Response(
+                    207,
+                    content=b"<d:multistatus xmlns:d='DAV:' />",
+                    request=request,
+                )
+            return httpx.Response(404, request=request)
+        if request.method == "MKCOL":
+            return httpx.Response(201, request=request)
+        return httpx.Response(405, request=request)
+
+    async def scenario() -> None:
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            await worker._ensure_directories(
+                client,
+                ["aliyun-drive", "Telegram", "test-chat", "2026", "07"],
+            )
+
+    asyncio.run(scenario())
+
+    assert ("MKCOL", "/dav/aliyun-drive") not in requests
+    assert ("MKCOL", "/dav/aliyun-drive/Telegram") not in requests
+    assert [item for item in requests if item[0] == "MKCOL"] == [
+        ("MKCOL", "/dav/aliyun-drive/Telegram/test-chat"),
+        ("MKCOL", "/dav/aliyun-drive/Telegram/test-chat/2026"),
+        ("MKCOL", "/dav/aliyun-drive/Telegram/test-chat/2026/07"),
+    ]
+
+
 def test_openlist_process_does_not_inherit_proxy_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

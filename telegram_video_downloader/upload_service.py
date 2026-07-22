@@ -370,9 +370,20 @@ class UploadWorker(QObject):
     async def _ensure_directories(
         self, client: httpx.AsyncClient, parts: list[str]
     ) -> None:
-        current: list[str] = []
-        for part in parts:
+        if not parts:
+            return
+
+        mount = [parts[0]]
+        if await self._propfind(client, mount) is None:
+            raise RuntimeError(
+                f"\u672a\u627e\u5230 /{parts[0]}\uff0c\u8bf7\u5728 OpenList \u4e2d\u5b8c\u6210\u963f\u91cc\u4e91\u76d8\u6302\u8f7d\u3002"
+            )
+
+        current = mount.copy()
+        for part in parts[1:]:
             current.append(part)
+            if await self._propfind(client, current) is not None:
+                continue
             response = await client.request("MKCOL", self._webdav_url(current))
             if response.status_code not in {200, 201, 204, 405}:
                 if response.status_code == 409:
