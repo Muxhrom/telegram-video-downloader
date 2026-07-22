@@ -12,6 +12,7 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 import zipfile
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -28,6 +29,39 @@ from .storage import Storage
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+class UploadRateTracker:
+    def __init__(
+        self,
+        clock: Callable[[], float] = time.monotonic,
+        minimum_sample_seconds: float = 1.0,
+        window_seconds: float = 5.0,
+    ) -> None:
+        self.clock = clock
+        self.minimum_sample_seconds = minimum_sample_seconds
+        self.window_seconds = window_seconds
+        self.samples: deque[tuple[float, int]] = deque([(clock(), 0)])
+
+    def update(self, current: int, total: int) -> tuple[float, float]:
+        now = self.clock()
+        self.samples.append((now, current))
+        cutoff = now - self.window_seconds
+        while len(self.samples) > 2 and self.samples[1][0] <= cutoff:
+            self.samples.popleft()
+
+        if total > 0 and current >= total:
+            return 0.0, 0.0
+
+        first_time, first_bytes = self.samples[0]
+        elapsed = now - first_time
+        transferred = current - first_bytes
+        if elapsed < self.minimum_sample_seconds or transferred <= 0:
+            return 0.0, 0.0
+
+        speed = transferred / elapsed
+        eta = (total - current) / speed if speed > 0 and total > current else 0.0
+        return speed, eta
 
 
 class FileProgressStream(httpx.AsyncByteStream):
@@ -55,8 +89,8 @@ class FileProgressStream(httpx.AsyncByteStream):
                 if not chunk:
                     break
                 current += len(chunk)
-                self.progress(current, total)
                 yield chunk
+                self.progress(current, total)
 
 
 class UploadWorker(QObject):
@@ -400,18 +434,12 @@ class UploadWorker(QObject):
         parts = self._remote_parts(job, processed)
         password = self.openlist.password()
         timeout = httpx.Timeout(30.0, read=None, write=None, pool=30.0)
-        started = time.monotonic()
-        last_time = started
-        last_bytes = 0
-        speed = 0.0
+        rate_tracker: UploadRateTracker | None = None
 
         def report(current: int, total: int) -> None:
-            nonlocal last_time, last_bytes, speed
-            now = time.monotonic()
-            elapsed = max(now - last_time, 0.001)
-            instant = max(0.0, (current - last_bytes) / elapsed)
-            speed = instant if speed <= 0 else speed * 0.7 + instant * 0.3
-            eta = (total - current) / speed if speed > 0 else 0.0
+            assert rate_tracker is not None
+            speed, eta = rate_tracker.update(current, total)
+            phase = "cloud_commit" if total > 0 and current >= total else "sending"
             self.upload_progress.emit(*key, int(current * 100 / total) if total else 0)
             self.upload_metrics.emit(
                 *key,
@@ -420,10 +448,9 @@ class UploadWorker(QObject):
                     "total": total,
                     "speed": speed,
                     "eta": eta,
+                    "phase": phase,
                 },
             )
-            last_time = now
-            last_bytes = current
 
         try:
             async with httpx.AsyncClient(
@@ -461,6 +488,7 @@ class UploadWorker(QObject):
                     *key, "uploading", remote_path, processed.name, remote_path
                 )
                 self.upload_state.emit(*key, "uploading", remote_path)
+                rate_tracker = UploadRateTracker()
                 stream = FileProgressStream(
                     processed,
                     self._pause_event,

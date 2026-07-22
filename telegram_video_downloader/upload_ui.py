@@ -196,10 +196,15 @@ class UploadManagerDialog(QDialog):
         total = int(metrics.get("total", 0))
         speed = float(metrics.get("speed", 0))
         eta = float(metrics.get("eta", 0))
+        phase = str(metrics.get("phase", "sending"))
         self._speeds[key] = speed
         self.table.item(row, 5).setText(f"{human_size(int(speed))}/s" if speed else "-")
         self.table.item(row, 6).setText(f"{human_size(current)} / {human_size(total)}")
         self.table.item(row, 7).setText(human_duration(eta) if eta else "-")
+        if phase == "cloud_commit":
+            self.table.item(row, 3).setText("\u4e91\u7aef\u5199\u5165\u4e2d")
+        elif self._states.get(key) == "uploading":
+            self.table.item(row, 3).setText("\u4e0a\u4f20\u4e2d")
         self._update_summary()
 
     def update_priority(self, chat_id: int, message_id: int, priority: int) -> None:
