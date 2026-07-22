@@ -13,7 +13,7 @@ from telegram_video_downloader.config import AppConfig
 from telegram_video_downloader.openlist_manager import OpenListManager
 from telegram_video_downloader.paths import AppPaths
 from telegram_video_downloader.storage import Storage
-from telegram_video_downloader.upload_service import UploadWorker
+from telegram_video_downloader.upload_service import UploadRateTracker, UploadWorker
 
 
 def make_paths(root: Path) -> AppPaths:
@@ -75,6 +75,27 @@ def test_propfind_parses_remote_size_and_etag(tmp_path: Path) -> None:
             return await worker._propfind(client, ["aliyun-drive", "video.mp4"])
 
     assert asyncio.run(scenario()) == {"size": 12345, "etag": "abc"}
+
+
+def test_upload_rate_tracker_ignores_short_initial_spike() -> None:
+    now = [0.0]
+    tracker = UploadRateTracker(clock=lambda: now[0])
+
+    now[0] = 0.01
+    assert tracker.update(1024 * 1024, 100 * 1024 * 1024) == (0.0, 0.0)
+
+    now[0] = 1.01
+    speed, eta = tracker.update(11 * 1024 * 1024, 100 * 1024 * 1024)
+    assert speed == pytest.approx(11 * 1024 * 1024 / 1.01)
+    assert eta == pytest.approx(89 * 1024 * 1024 / speed)
+
+
+def test_upload_rate_tracker_hides_speed_during_cloud_commit() -> None:
+    now = [0.0]
+    tracker = UploadRateTracker(clock=lambda: now[0])
+
+    now[0] = 2.0
+    assert tracker.update(100, 100) == (0.0, 0.0)
 
 
 def test_ensure_directories_does_not_recreate_existing_mount(
