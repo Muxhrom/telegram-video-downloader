@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telegram-video-downloader"
+version = "1.1.1"
+description = "通过本地 Clash 代理下载 Telegram 视频并直连备份至阿里云盘"
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6>=6.8,<7",
+    "Telethon>=1.40,<2",
+    "python-socks[asyncio]>=2.7,<3",
+    "keyring>=25,<26",
+    "httpx[socks]>=0.28,<0.29",
+]
+
+[project.scripts]
+telegram-video-downloader = "telegram_video_downloader.main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
