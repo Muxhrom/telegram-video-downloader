@@ -17,9 +17,10 @@ def test_sanitize_windows_illegal_and_reserved_names() -> None:
 
 def test_name_priority_and_fallback() -> None:
     date = datetime(2026, 7, 22, 8, 9, 10, tzinfo=timezone.utc)
+    local_stamp = date.astimezone().strftime("%Y%m%d_%H%M%S")
     assert choose_video_name("原视频.MKV", "说明", date, 42, ".mkv") == "原视频.mkv"
     assert choose_video_name(None, "第一行\n第二行", date, 42, ".mp4") == "第一行.mp4"
-    assert choose_video_name(None, "", date, 42, ".mp4") == "video_20260722_160910_42.mp4"
+    assert choose_video_name(None, "", date, 42, ".mp4") == f"video_{local_stamp}_42.mp4"
 
 
 def test_extension_and_unique_target(tmp_path: Path) -> None:
