@@ -103,6 +103,7 @@ def test_openlist_process_does_not_inherit_proxy_environment(
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     monkeypatch.setattr(manager, "choose_port", lambda: 5244)
+    monkeypatch.setattr(manager, "running", lambda: False)
     monkeypatch.setattr(manager, "_tcp_ready", lambda port: True)
     monkeypatch.setattr(manager, "password", lambda: "test-password")
     monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:7890")
