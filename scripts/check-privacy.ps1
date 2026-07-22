@@ -24,3 +24,4 @@ if (-not [string]::IsNullOrWhiteSpace($profilePath)) {
 }
 
 Write-Host '隐私检查通过：未跟踪会话、日志、数据库、媒体、构建产物或当前用户绝对路径。'
+exit 0
