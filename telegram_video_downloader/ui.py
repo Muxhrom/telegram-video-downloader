@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QDate, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QDesktopServices, QIcon
+from PySide6.QtGui import QAction, QBrush, QColor, QDesktopServices, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -115,10 +115,19 @@ class DownloadManagerDialog(QDialog):
     acceleration_requested = Signal(bool)
     notice = Signal(str, str)
 
+    NAME_COLUMN = 0
+    SOURCE_COLUMN = 1
+    STATUS_COLUMN = 2
+    PROGRESS_COLUMN = 3
+    SPEED_COLUMN = 4
+    SIZE_COLUMN = 5
+    ETA_COLUMN = 6
+    PATH_COLUMN = 7
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("下载管理")
-        self.resize(980, 520)
+        self.resize(1160, 620)
         self._row_by_key: dict[tuple[int, int], int] = {}
         self._states: dict[tuple[int, int], str] = {}
         self._speeds: dict[tuple[int, int], float] = {}
@@ -126,23 +135,27 @@ class DownloadManagerDialog(QDialog):
 
         layout = QVBoxLayout(self)
         self.summary_label = QLabel("暂无下载任务")
+        self.summary_label.setObjectName("summaryLabel")
         layout.addWidget(self.summary_label)
+
         acceleration_row = QHBoxLayout()
         self.acceleration_checkbox = QCheckBox("安全加速（最多 3 个文件并行）")
         self.acceleration_checkbox.setToolTip(
             "仅提高多个排队视频的总下载速度，不会并行切割单个视频；"
             "遇到 Telegram 限流或网络异常时会自动关闭。"
         )
-        self.acceleration_status = QLabel("普通模式：最多同时下载 2 个文件；cryptg 本地加速始终启用")
+        self.acceleration_status = QLabel(
+            "普通模式：最多同时下载 2 个文件；cryptg 本地加速始终启用"
+        )
         acceleration_row.addWidget(self.acceleration_checkbox)
         acceleration_row.addWidget(self.acceleration_status, 1)
         layout.addLayout(acceleration_row)
-        self.table = QTableWidget(0, 9)
+
+        self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels(
             [
                 "视频名称",
                 "来源",
-                "优先级",
                 "状态",
                 "进度",
                 "速度",
@@ -152,46 +165,42 @@ class DownloadManagerDialog(QDialog):
             ]
         )
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(42)
         self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setColumnWidth(0, 280)
-        self.table.setColumnWidth(1, 160)
-        self.table.setColumnWidth(2, 75)
-        self.table.setColumnWidth(3, 95)
-        self.table.setColumnWidth(4, 140)
-        self.table.setColumnWidth(5, 100)
-        self.table.setColumnWidth(6, 155)
-        self.table.setColumnWidth(7, 90)
-        self.table.setColumnWidth(8, 280)
-        layout.addWidget(self.table)
+        for column, width in enumerate((300, 150, 105, 145, 105, 170, 100, 300)):
+            self.table.setColumnWidth(column, width)
+        layout.addWidget(self.table, 1)
 
         buttons = QHBoxLayout()
         self.pause_button = QPushButton("暂停队列")
-        self.high_button = QPushButton("优先下载")
-        self.normal_button = QPushButton("普通优先级")
-        self.low_button = QPushButton("低优先级")
+        self.priority_button = QPushButton("优先下载选中任务")
+        self.priority_button.setObjectName("primaryButton")
+        self.priority_button.setToolTip("将选中的等待任务移动到下载队列前面")
         self.cancel_button = QPushButton("取消选中")
         self.retry_button = QPushButton("重试失败/取消")
         self.clear_button = QPushButton("清理已完成")
         self.open_button = QPushButton("打开所在目录")
         self.close_button = QPushButton("关闭")
-        buttons.addWidget(self.pause_button)
-        buttons.addWidget(self.high_button)
-        buttons.addWidget(self.normal_button)
-        buttons.addWidget(self.low_button)
-        buttons.addWidget(self.cancel_button)
-        buttons.addWidget(self.retry_button)
-        buttons.addWidget(self.clear_button)
-        buttons.addWidget(self.open_button)
+        for button in (
+            self.pause_button,
+            self.priority_button,
+            self.cancel_button,
+            self.retry_button,
+            self.clear_button,
+            self.open_button,
+        ):
+            buttons.addWidget(button)
         buttons.addStretch()
         buttons.addWidget(self.close_button)
         layout.addLayout(buttons)
 
         self.pause_button.clicked.connect(self.pause_requested.emit)
         self.acceleration_checkbox.toggled.connect(self.acceleration_requested.emit)
-        self.high_button.clicked.connect(lambda: self._set_selected_priority(0))
-        self.normal_button.clicked.connect(lambda: self._set_selected_priority(1))
-        self.low_button.clicked.connect(lambda: self._set_selected_priority(2))
+        self.priority_button.clicked.connect(self._prioritize_selected)
         self.cancel_button.clicked.connect(self._cancel_selected)
         self.retry_button.clicked.connect(self._retry_selected)
         self.clear_button.clicked.connect(self._clear_completed)
@@ -212,18 +221,18 @@ class DownloadManagerDialog(QDialog):
             progress.setRange(0, 100)
             progress.setValue(0)
             progress.setFormat("%p%")
-            self.table.setCellWidget(row, 4, progress)
-        self.table.item(row, 0).setText(item["name"])
-        self.table.item(row, 0).setData(Qt.UserRole, payload)
-        self.table.item(row, 1).setText(item.get("chat_title", ""))
-        self.table.item(row, 2).setText(self._priority_label(int(payload.get("priority", 1))))
-        self.table.item(row, 3).setText("等待下载")
-        self.table.item(row, 5).setText("-")
-        self.table.item(row, 6).setText(f"0 B / {human_size(int(item.get('size', 0)))}")
-        self.table.item(row, 7).setText("-")
-        self.table.item(row, 8).setText(payload["directory"])
-        progress = self.table.cellWidget(row, 4)
-        progress.setValue(0)
+            self.table.setCellWidget(row, self.PROGRESS_COLUMN, progress)
+        self.table.item(row, self.NAME_COLUMN).setText(item["name"])
+        self.table.item(row, self.NAME_COLUMN).setData(Qt.UserRole, payload)
+        self.table.item(row, self.SOURCE_COLUMN).setText(item.get("chat_title", ""))
+        self.table.item(row, self.STATUS_COLUMN).setText("等待下载")
+        self.table.item(row, self.SPEED_COLUMN).setText("-")
+        self.table.item(row, self.SIZE_COLUMN).setText(
+            f"0 B / {human_size(int(item.get('size', 0)))}"
+        )
+        self.table.item(row, self.ETA_COLUMN).setText("-")
+        self.table.item(row, self.PATH_COLUMN).setText(payload["directory"])
+        self.table.cellWidget(row, self.PROGRESS_COLUMN).setValue(0)
         self._states[key] = "queued"
         self._speeds[key] = 0.0
         self._update_summary()
@@ -231,7 +240,7 @@ class DownloadManagerDialog(QDialog):
     def update_progress(self, chat_id: int, message_id: int, progress: int) -> None:
         row = self._row_by_key.get((int(chat_id), int(message_id)))
         if row is not None:
-            self.table.cellWidget(row, 4).setValue(progress)
+            self.table.cellWidget(row, self.PROGRESS_COLUMN).setValue(progress)
 
     def update_metrics(self, chat_id: int, message_id: int, metrics: dict) -> None:
         key = (int(chat_id), int(message_id))
@@ -243,9 +252,15 @@ class DownloadManagerDialog(QDialog):
         speed = float(metrics.get("speed", 0.0))
         eta = float(metrics.get("eta", 0.0))
         self._speeds[key] = speed if self._states.get(key) == "downloading" else 0.0
-        self.table.item(row, 5).setText(f"{human_size(int(speed))}/s" if speed > 0 else "-")
-        self.table.item(row, 6).setText(f"{human_size(current)} / {human_size(total)}")
-        self.table.item(row, 7).setText(human_duration(eta) if eta > 0 else "-")
+        self.table.item(row, self.SPEED_COLUMN).setText(
+            f"{human_size(int(speed))}/s" if speed > 0 else "-"
+        )
+        self.table.item(row, self.SIZE_COLUMN).setText(
+            f"{human_size(current)} / {human_size(total)}"
+        )
+        self.table.item(row, self.ETA_COLUMN).setText(
+            human_duration(eta) if eta > 0 else "-"
+        )
         self._update_summary()
 
     def update_state(
@@ -263,27 +278,18 @@ class DownloadManagerDialog(QDialog):
             "cancelled": "已取消",
         }
         self._states[key] = state
-        status_item = self.table.item(row, 3)
+        status_item = self.table.item(row, self.STATUS_COLUMN)
         status_item.setText(labels.get(state, state))
         status_item.setToolTip(detail)
         if state in {"downloading", "completed"} and detail:
-            self.table.item(row, 8).setText(detail)
+            self.table.item(row, self.PATH_COLUMN).setText(detail)
         if state == "completed":
-            self.table.cellWidget(row, 4).setValue(100)
+            self.table.cellWidget(row, self.PROGRESS_COLUMN).setValue(100)
         if state != "downloading":
             self._speeds[key] = 0.0
-            self.table.item(row, 5).setText("-")
-            self.table.item(row, 7).setText("-")
+            self.table.item(row, self.SPEED_COLUMN).setText("-")
+            self.table.item(row, self.ETA_COLUMN).setText("-")
         self._update_summary()
-
-    def update_priority(self, chat_id: int, message_id: int, priority: int) -> None:
-        row = self._row_by_key.get((int(chat_id), int(message_id)))
-        if row is not None:
-            self.table.item(row, 2).setText(self._priority_label(priority))
-
-    @staticmethod
-    def _priority_label(priority: int) -> str:
-        return {0: "高", 1: "普通", 2: "低"}.get(int(priority), "普通")
 
     def set_paused(self, paused: bool) -> None:
         self._paused = paused
@@ -304,29 +310,31 @@ class DownloadManagerDialog(QDialog):
     def _cancel_selected(self) -> None:
         keys = []
         for row in self._selected_rows():
-            payload = self.table.item(row, 0).data(Qt.UserRole)
+            payload = self.table.item(row, self.NAME_COLUMN).data(Qt.UserRole)
             item = payload["item"]
             keys.append((int(item["chat_id"]), int(item["message_id"])))
         if keys:
             self.cancel_requested.emit(keys)
 
-    def _set_selected_priority(self, priority: int) -> None:
+    def _prioritize_selected(self) -> None:
         keys = []
         for row in self._selected_rows():
-            payload = self.table.item(row, 0).data(Qt.UserRole)
+            payload = self.table.item(row, self.NAME_COLUMN).data(Qt.UserRole)
             item = payload["item"]
             key = (int(item["chat_id"]), int(item["message_id"]))
             if self._states.get(key) == "queued":
                 keys.append(key)
-                payload["priority"] = priority
-                self.table.item(row, 2).setText(self._priority_label(priority))
+                payload["priority"] = 0
         if keys:
-            self.priority_requested.emit(keys, priority)
+            self.priority_requested.emit(keys, 0)
+            self.notice.emit(f"已将 {len(keys)} 个等待任务移到队列前面。", "success")
+        else:
+            self.notice.emit("请选中尚未开始的等待任务。", "warning")
 
     def _retry_selected(self) -> None:
         jobs = []
         for row in self._selected_rows():
-            payload = self.table.item(row, 0).data(Qt.UserRole)
+            payload = self.table.item(row, self.NAME_COLUMN).data(Qt.UserRole)
             item = payload["item"]
             key = (int(item["chat_id"]), int(item["message_id"]))
             if self._states.get(key) in {"failed", "cancelled"}:
@@ -340,8 +348,8 @@ class DownloadManagerDialog(QDialog):
             self.notice.emit("请先选择一个下载任务。", "warning")
             return
         row = rows[0]
-        payload = self.table.item(row, 0).data(Qt.UserRole)
-        displayed = Path(self.table.item(row, 8).text())
+        payload = self.table.item(row, self.NAME_COLUMN).data(Qt.UserRole)
+        displayed = Path(self.table.item(row, self.PATH_COLUMN).text())
         directory = displayed.parent if displayed.suffix else Path(payload["directory"])
         directory.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
@@ -357,13 +365,16 @@ class DownloadManagerDialog(QDialog):
             self._speeds.pop(key, None)
         self._row_by_key.clear()
         for row in range(self.table.rowCount()):
-            payload = self.table.item(row, 0).data(Qt.UserRole)
+            payload = self.table.item(row, self.NAME_COLUMN).data(Qt.UserRole)
             item = payload["item"]
             self._row_by_key[(int(item["chat_id"]), int(item["message_id"]))] = row
         self._update_summary()
 
     def _update_summary(self) -> None:
-        counts = {state: 0 for state in ("queued", "downloading", "completed", "failed", "cancelled")}
+        counts = {
+            state: 0
+            for state in ("queued", "downloading", "completed", "failed", "cancelled")
+        }
         for state in self._states.values():
             if state in counts:
                 counts[state] += 1
@@ -504,21 +515,36 @@ class MainWindow(QMainWindow):
         auto_row.addWidget(self.refresh_names_button)
         right_layout.addLayout(auto_row)
 
-        self.table = QTableWidget(0, 8)
+        self.table = QTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels(
-            ["选择", "视频名称", "类型", "大小", "日期", "来源", "下载状态", "上传状态"]
+            [
+                "选择",
+                "预览",
+                "视频名称",
+                "类型",
+                "大小",
+                "日期",
+                "来源",
+                "下载状态",
+                "上传状态",
+            ]
         )
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(88)
         self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setColumnWidth(0, 55)
-        self.table.setColumnWidth(1, 330)
+        for column, width in enumerate((55, 145, 330, 90, 95, 145, 150, 105, 105)):
+            self.table.setColumnWidth(column, width)
+        self.table.cellDoubleClicked.connect(self.show_thumbnail_preview)
         right_layout.addWidget(self.table, 1)
 
         action_row = QHBoxLayout()
         self.select_all_button = QPushButton("全选")
         self.invert_button = QPushButton("反选")
         self.download_button = QPushButton("下载所选")
+        self.download_button.setObjectName("primaryButton")
         self.upload_button = QPushButton("上传所选已下载")
         self.pause_button = QPushButton("暂停队列")
         self.cancel_button = QPushButton("取消所选任务")
@@ -611,7 +637,7 @@ class MainWindow(QMainWindow):
         self.worker.download_metrics.connect(self.download_manager.update_metrics)
         self.worker.download_state.connect(self.update_download_state)
         self.worker.download_job.connect(self.download_manager.add_job)
-        self.worker.download_priority.connect(self.download_manager.update_priority)
+        self.worker.thumbnail_ready.connect(self.set_video_thumbnail)
         self.worker.acceleration_changed.connect(
             self.download_manager.set_acceleration_state
         )
@@ -623,11 +649,6 @@ class MainWindow(QMainWindow):
             lambda keys: self.upload_worker.submit("cancel_uploads", keys)
         )
         self.upload_manager.retry_requested.connect(self.retry_uploads)
-        self.upload_manager.priority_requested.connect(
-            lambda keys, priority: self.upload_worker.submit(
-                "set_priority", keys, priority
-            )
-        )
         self.upload_manager.pause_requested.connect(self.toggle_upload_pause)
         self.upload_manager.refresh_requested.connect(self.refresh_cloud_upload_status)
         self.upload_manager.open_cloud_requested.connect(self.open_cloud)
@@ -662,7 +683,6 @@ class MainWindow(QMainWindow):
         self.upload_worker.upload_state.connect(self.update_upload_state)
         self.upload_worker.upload_progress.connect(self.upload_manager.update_progress)
         self.upload_worker.upload_metrics.connect(self.upload_manager.update_metrics)
-        self.upload_worker.upload_priority.connect(self.upload_manager.update_priority)
         self.upload_worker.cloud_state.connect(self.cloud_settings.set_state)
 
     def _auto_connect(self) -> None:
@@ -787,6 +807,13 @@ class MainWindow(QMainWindow):
             check.setCheckState(Qt.Unchecked)
             check.setData(Qt.UserRole, video)
             self.table.setItem(row, 0, check)
+            preview = QLabel("加载中…")
+            preview.setAlignment(Qt.AlignCenter)
+            preview.setMinimumSize(128, 72)
+            preview.setStyleSheet(
+                "color: #6b7280; background: #eef2f5; border-radius: 6px;"
+            )
+            self.table.setCellWidget(row, 1, preview)
             values = (
                 video["name"],
                 video["media_kind"],
@@ -796,13 +823,16 @@ class MainWindow(QMainWindow):
                 self._download_label(key),
                 self._upload_label(key),
             )
-            for column, value in enumerate(values, start=1):
+            for column, value in enumerate(values, start=2):
                 self.table.setItem(row, column, QTableWidgetItem(value))
             self._row_by_key[key] = row
             self._apply_existing_mark(row)
         if videos:
-            self.table.sortItems(4, Qt.DescendingOrder)
+            self.table.sortItems(5, Qt.DescendingOrder)
             self._rebuild_row_index()
+            self.worker.submit(
+                "load_video_thumbnails", request_id, chat_id, list(videos)
+            )
         if finished:
             self.video_page_state = page_state
             self.reached_end = bool(page_state.get("reached_end", False))
@@ -810,6 +840,67 @@ class MainWindow(QMainWindow):
             self.more_button.setEnabled(not self.reached_end)
             self.more_button.setText("已到最早视频" if self.reached_end else "加载更多")
         self.filter_videos()
+
+    def set_video_thumbnail(
+        self,
+        request_id: int,
+        chat_id: int,
+        message_id: int,
+        data: bytes,
+        error: str,
+    ) -> None:
+        if (
+            not self.current_chat
+            or request_id != self.video_request_id
+            or int(chat_id) != int(self.current_chat["chat_id"])
+        ):
+            return
+        row = self._row_by_key.get((int(chat_id), int(message_id)))
+        if row is None:
+            return
+        preview = self.table.cellWidget(row, 1)
+        if not isinstance(preview, QLabel):
+            return
+        pixmap = QPixmap()
+        if data and pixmap.loadFromData(data):
+            preview.setPixmap(
+                pixmap.scaled(132, 76, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            )
+            preview.setText("")
+            preview.setProperty("thumbnailData", bytes(data))
+            preview.setToolTip("双击查看大图")
+            preview.setStyleSheet("background: #111827; border-radius: 6px;")
+        else:
+            preview.setText("无预览")
+            preview.setToolTip(error or "Telegram 未提供缩略图")
+            preview.setStyleSheet(
+                "color: #8a8f98; background: #eef2f5; border-radius: 6px;"
+            )
+
+    def show_thumbnail_preview(self, row: int, column: int) -> None:
+        if column != 1:
+            return
+        preview = self.table.cellWidget(row, column)
+        if not isinstance(preview, QLabel):
+            return
+        data = preview.property("thumbnailData")
+        if not data:
+            self.show_notice("这个视频没有可用的 Telegram 缩略图。", "warning")
+            return
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(data):
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("视频截图预览")
+        dialog.resize(720, 440)
+        layout = QVBoxLayout(dialog)
+        image = QLabel()
+        image.setAlignment(Qt.AlignCenter)
+        image.setPixmap(
+            pixmap.scaled(680, 380, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        )
+        layout.addWidget(image, 1)
+        dialog.exec()
 
     def filter_videos(self, *_: object) -> None:
         needle = self.video_search.text().casefold().strip()
@@ -920,7 +1011,7 @@ class MainWindow(QMainWindow):
             if not source.is_file():
                 row = self._row_by_key.get(key)
                 if row is not None:
-                    self.table.item(row, 6).setText("本地已删除")
+                    self.table.item(row, 7).setText("本地已删除")
                 continue
             self.upload_worker.submit(
                 "enqueue_upload",
@@ -992,7 +1083,7 @@ class MainWindow(QMainWindow):
         self.download_manager.update_progress(chat_id, message_id, progress)
         row = self._row_by_key.get(key)
         if row is not None:
-            self.table.item(row, 6).setText(f"下载中 {progress}%")
+            self.table.item(row, 7).setText(f"下载中 {progress}%")
         if self._progress_by_key:
             self.overall_progress.setValue(
                 sum(self._progress_by_key.values()) // len(self._progress_by_key)
@@ -1010,8 +1101,8 @@ class MainWindow(QMainWindow):
             "cancelled": "已取消",
         }
         if row is not None:
-            self.table.item(row, 6).setText(labels.get(state, state))
-            self.table.item(row, 6).setToolTip(detail)
+            self.table.item(row, 7).setText(labels.get(state, state))
+            self.table.item(row, 7).setToolTip(detail)
         self.download_manager.update_state(chat_id, message_id, state, detail)
         if state == "completed":
             completed = Path(detail)
@@ -1071,7 +1162,7 @@ class MainWindow(QMainWindow):
     def retry_uploads(self, jobs: list[dict]) -> None:
         for job in jobs:
             payload = dict(job)
-            payload["priority"] = int(payload.get("priority", 1))
+            payload["priority"] = 1
             self.upload_worker.submit("enqueue_upload", payload)
 
     def update_upload_state(
@@ -1088,8 +1179,8 @@ class MainWindow(QMainWindow):
             "remote_missing": "云端已删除",
         }
         if row is not None:
-            self.table.item(row, 7).setText(labels.get(state, state))
-            self.table.item(row, 7).setToolTip(detail)
+            self.table.item(row, 8).setText(labels.get(state, state))
+            self.table.item(row, 8).setToolTip(detail)
         self.upload_manager.update_state(chat_id, message_id, state, detail)
 
     def _upload_label(self, key: tuple[int, int]) -> str:
@@ -1157,17 +1248,19 @@ class MainWindow(QMainWindow):
         data = self.table.item(row, 0).data(Qt.UserRole)
         exists = data["name"].casefold() in self._existing_names
         brush = QBrush(QColor("#8a8a8a")) if exists else QBrush()
-        for column in range(1, self.table.columnCount()):
+        for column in range(2, self.table.columnCount()):
             item = self.table.item(row, column)
+            if item is None:
+                continue
             item.setForeground(brush)
             font = item.font()
             font.setItalic(exists)
             item.setFont(font)
-        name_item = self.table.item(row, 1)
+        name_item = self.table.item(row, 2)
         name_item.setToolTip(
             "当前保存目录中存在同名视频文件" if exists else ""
         )
-        status_item = self.table.item(row, 6)
+        status_item = self.table.item(row, 7)
         if exists and status_item.text() == "未下载":
             status_item.setText("目录中已存在")
         elif not exists and status_item.text() == "目录中已存在":

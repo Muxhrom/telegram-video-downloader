@@ -234,6 +234,49 @@ def test_openlist_password_is_updated_without_inheriting_proxy(
     assert saved == ["CustomPassword123!"]
 
 
+def test_ffmpeg_standardization_maps_playable_streams_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = make_paths(tmp_path)
+    paths.ensure()
+    ffmpeg = tmp_path / "ffmpeg.exe"
+    ffmpeg.write_bytes(b"placeholder")
+    source = tmp_path / "with-timecode.mp4"
+    source.write_bytes(b"video")
+    worker = UploadWorker(paths, AppConfig(ffmpeg_path=str(ffmpeg)))
+    worker.storage.save_upload_job(-1001, 8, "测试群", str(source), source.stat().st_size)
+    captured: list[str] = []
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            Path(captured[-1]).write_bytes(b"remuxed")
+            return b"", b""
+
+    async def fake_create_subprocess_exec(*arguments, **kwargs):
+        del kwargs
+        captured.extend(str(value) for value in arguments)
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    output = asyncio.run(
+        worker._standardize(
+            {
+                "chat_id": -1001,
+                "message_id": 8,
+                "chat_title": "测试群",
+                "file_path": str(source),
+            }
+        )
+    )
+
+    assert output.is_file()
+    mapped = [captured[index + 1] for index, value in enumerate(captured[:-1]) if value == "-map"]
+    assert mapped == ["0:v?", "0:a?", "0:s?"]
+    assert "0" not in mapped
+
+
 def test_ffmpeg_metadata_standardization_without_reencoding(tmp_path: Path) -> None:
     ffmpeg = shutil.which("ffmpeg")
     ffprobe = shutil.which("ffprobe")

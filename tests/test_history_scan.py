@@ -34,7 +34,9 @@ def media_message(
         id=message_id,
         date=datetime(2026, 7, 22, 12, message_id % 60, tzinfo=timezone.utc),
         message=f"message {message_id}",
-        document=SimpleNamespace(attributes=attributes, mime_type=mime, size=message_id),
+        document=SimpleNamespace(
+            attributes=attributes, mime_type=mime, size=message_id, thumbs=[object()]
+        ),
         file=SimpleNamespace(name=name or f"{message_id}.mp4"),
     )
 
@@ -62,12 +64,26 @@ class FakeClient:
             ],
         }
         self.calls: list[tuple[str, int]] = []
+        self.download_calls: list[tuple[int, int]] = []
 
     async def get_entity(self, chat_id: int):
         return SimpleNamespace(id=chat_id, title="测试群")
 
     async def get_input_entity(self, chat_id: int):
         return SimpleNamespace(id=chat_id)
+
+    async def get_messages(self, entity, ids: int):
+        del entity
+        for messages in self.messages.values():
+            for message in messages:
+                if message.id == ids:
+                    return message
+        return None
+
+    async def download_media(self, message, file, thumb: int):
+        assert file is bytes
+        self.download_calls.append((int(message.id), int(thumb)))
+        return b"fake-jpeg-thumbnail"
 
     async def iter_messages(self, entity, limit: int, offset_id: int, filter):
         del entity
@@ -125,6 +141,34 @@ def test_filter_cursors_are_resumed_without_raw_message_limit(tmp_path: Path) ->
         ("InputMessagesFilterRoundVideo", 4000),
         ("InputMessagesFilterDocument", 3000),
     ]
+
+
+def test_thumbnail_loader_uses_telegram_thumb_and_local_cache(tmp_path: Path) -> None:
+    paths = make_paths(tmp_path)
+    paths.ensure()
+    worker = TelegramWorker(paths, AppConfig())
+    client = FakeClient()
+    worker.client = client
+    chat_id = -1002985557858
+    message = client.messages["InputMessagesFilterVideo"][0]
+    key = (chat_id, int(message.id))
+    worker._thumbnail_request_id = 7
+    worker._thumbnail_messages[key] = message
+    events: list[tuple] = []
+    worker.thumbnail_ready.connect(lambda *args: events.append(args))
+    item = {"message_id": message.id}
+
+    asyncio.run(worker.load_video_thumbnails(7, chat_id, [item]))
+
+    assert events[-1][0:3] == (7, chat_id, message.id)
+    assert events[-1][3] == b"fake-jpeg-thumbnail"
+    assert events[-1][4] == ""
+    assert client.download_calls == [(message.id, -1)]
+    cache = paths.data_dir / "thumbnails" / str(chat_id) / f"{message.id}.thumb"
+    assert cache.read_bytes() == b"fake-jpeg-thumbnail"
+
+    asyncio.run(worker.load_video_thumbnails(7, chat_id, [item]))
+    assert client.download_calls == [(message.id, -1)]
 
 
 def test_download_directory_names_and_priority_queue(tmp_path: Path) -> None:

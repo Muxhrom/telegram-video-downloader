@@ -1,3 +1,4 @@
+import base64
 import os
 from pathlib import Path
 
@@ -72,8 +73,14 @@ def test_main_window_starts_and_worker_stops(tmp_path: Path) -> None:
     window.video_search.clear()
     assert not window.table.isRowHidden(0)
     window.set_downloaded_names(0, {"目标视频.mp4"}, "")
-    assert window.table.item(0, 6).text() == "目录中已存在"
-    assert window.table.item(0, 1).foreground().color().name() == "#8a8a8a"
+    assert window.table.item(0, 7).text() == "目录中已存在"
+    assert window.table.item(0, 2).foreground().color().name() == "#8a8a8a"
+    thumbnail = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    window.set_video_thumbnail(1, large_chat_id, video["message_id"], thumbnail, "")
+    preview = window.table.cellWidget(0, 1)
+    assert preview.pixmap() is not None and not preview.pixmap().isNull()
 
     payload = {
         "item": video,
@@ -91,9 +98,23 @@ def test_main_window_starts_and_worker_stops(tmp_path: Path) -> None:
     )
     window.download_manager.update_progress(large_chat_id, video["message_id"], 50)
     assert window.download_manager.table.rowCount() == 1
-    assert window.download_manager.table.item(0, 3).text() == "下载中"
-    assert window.download_manager.table.item(0, 5).text() == "256 B/s"
-    assert window.download_manager.table.cellWidget(0, 4).value() == 50
+    assert window.download_manager.table.item(0, 2).text() == "下载中"
+    assert window.download_manager.table.item(0, 4).text() == "256 B/s"
+    assert window.download_manager.table.cellWidget(0, 3).value() == 50
+    assert "优先级" not in [
+        window.download_manager.table.horizontalHeaderItem(column).text()
+        for column in range(window.download_manager.table.columnCount())
+    ]
+    prioritized: list[tuple[list[tuple[int, int]], int]] = []
+    window.download_manager.priority_requested.connect(
+        lambda keys, priority: prioritized.append((keys, priority))
+    )
+    window.download_manager.update_state(
+        large_chat_id, video["message_id"], "queued", "等待下载"
+    )
+    window.download_manager.table.selectRow(0)
+    window.download_manager._prioritize_selected()
+    assert prioritized[-1] == ([(large_chat_id, video["message_id"])], 0)
     window.download_manager.set_acceleration_state(True, "安全加速已开启")
     assert window.download_manager.acceleration_checkbox.isChecked()
     assert window.download_manager.acceleration_status.text() == "安全加速已开启"
@@ -114,8 +135,12 @@ def test_main_window_starts_and_worker_stops(tmp_path: Path) -> None:
         video["message_id"],
         {"current": 512, "total": 1024, "speed": 128, "eta": 4},
     )
-    assert window.upload_manager.table.item(0, 3).text() == "上传中"
-    assert window.upload_manager.table.item(0, 5).text() == "128 B/s"
+    assert window.upload_manager.table.item(0, 2).text() == "上传中"
+    assert window.upload_manager.table.item(0, 4).text() == "128 B/s"
+    assert "优先级" not in [
+        window.upload_manager.table.horizontalHeaderItem(column).text()
+        for column in range(window.upload_manager.table.columnCount())
+    ]
     assert window.worker.stop_gracefully()
     assert window.upload_worker.stop_gracefully()
     window.tray.hide()
