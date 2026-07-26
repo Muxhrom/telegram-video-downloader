@@ -48,6 +48,7 @@ class TelegramWorker(QObject):
     download_state = Signal(object, object, str, str)
     download_job = Signal(object)
     download_priority = Signal(object, object, int)
+    thumbnail_ready = Signal(int, object, object, object, str)
     acceleration_changed = Signal(bool, str)
     downloaded_names_ready = Signal(int, object, str)
     connection_changed = Signal(bool, str)
@@ -76,6 +77,9 @@ class TelegramWorker(QObject):
         self._chat_entities: dict[int, Any] = {}
         self._chat_titles: dict[int, str] = {}
         self._video_scan_task: asyncio.Task | None = None
+        self._thumbnail_request_id = 0
+        self._thumbnail_messages: dict[tuple[int, int], Any] = {}
+        self._thumbnail_semaphore: asyncio.Semaphore | None = None
         self._shutting_down = False
         self._thread: threading.Thread | None = None
 
@@ -99,6 +103,7 @@ class TelegramWorker(QObject):
         self._pause_event = asyncio.Event()
         self._pause_event.set()
         self._acceleration_event = asyncio.Event()
+        self._thumbnail_semaphore = asyncio.Semaphore(2)
         worker_count = self.config.max_concurrent_downloads + 1
         self._queue_workers = [
             self.loop.create_task(self._download_worker(index))
@@ -227,6 +232,9 @@ class TelegramWorker(QObject):
             page_size,
             bool(page_state),
         )
+        if request_id != self._thumbnail_request_id:
+            self._thumbnail_request_id = request_id
+            self._thumbnail_messages.clear()
         previous = self._video_scan_task
         if previous and not previous.done():
             LOGGER.info("Cancelling previous video scan before request_id=%s", request_id)
@@ -332,6 +340,7 @@ class TelegramWorker(QObject):
                 if not info:
                     continue
                 seen_ids.add(message_id)
+                self._thumbnail_messages[(chat_id, message_id)] = message
                 candidates.append(info.to_dict())
             LOGGER.info(
                 "Video filter completed request_id=%s chat_id=%s filter=%s offset_id=%s "
@@ -448,6 +457,80 @@ class TelegramWorker(QObject):
             "round": "圆形视频",
             "document": "视频文件",
         }[key]
+
+    async def load_video_thumbnails(
+        self, request_id: int, chat_id: int, items: list[dict]
+    ) -> None:
+        """Load Telegram-provided thumbnails without downloading full videos."""
+        if request_id != self._thumbnail_request_id or not self.client:
+            return
+        if self._thumbnail_semaphore is None:
+            self._thumbnail_semaphore = asyncio.Semaphore(2)
+        cache_dir = self.paths.data_dir / "thumbnails" / str(int(chat_id))
+        for item in items:
+            if request_id != self._thumbnail_request_id:
+                return
+            message_id = int(item["message_id"])
+            key = (int(chat_id), message_id)
+            cache_file = cache_dir / f"{message_id}.thumb"
+            try:
+                if cache_file.is_file() and cache_file.stat().st_size:
+                    data = await asyncio.to_thread(cache_file.read_bytes)
+                else:
+                    message = self._thumbnail_messages.get(key)
+                    if message is None:
+                        entity = self._chat_entities.get(int(chat_id))
+                        if entity is None:
+                            entity = await self.client.get_input_entity(int(chat_id))
+                            self._chat_entities[int(chat_id)] = entity
+                        message = await self.client.get_messages(entity, ids=message_id)
+                    document = getattr(message, "document", None)
+                    if not message or not getattr(document, "thumbs", None):
+                        self.thumbnail_ready.emit(
+                            request_id, chat_id, message_id, b"", "Telegram 未提供缩略图"
+                        )
+                        self._thumbnail_messages.pop(key, None)
+                        continue
+                    async with self._thumbnail_semaphore:
+                        downloaded = await self.client.download_media(
+                            message, file=bytes, thumb=-1
+                        )
+                    data = bytes(downloaded) if downloaded else b""
+                    if data:
+                        await asyncio.to_thread(
+                            self._write_thumbnail_cache, cache_file, data
+                        )
+                if request_id == self._thumbnail_request_id:
+                    self.thumbnail_ready.emit(
+                        request_id,
+                        chat_id,
+                        message_id,
+                        data,
+                        "" if data else "缩略图为空",
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOGGER.warning(
+                    "Thumbnail load failed request_id=%s chat_id=%s message_id=%s: %s",
+                    request_id,
+                    chat_id,
+                    message_id,
+                    exc,
+                )
+                if request_id == self._thumbnail_request_id:
+                    self.thumbnail_ready.emit(
+                        request_id, chat_id, message_id, b"", "缩略图加载失败"
+                    )
+            finally:
+                self._thumbnail_messages.pop(key, None)
+
+    @staticmethod
+    def _write_thumbnail_cache(cache_file: Path, data: bytes) -> None:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        temporary = cache_file.with_name(cache_file.name + ".part")
+        temporary.write_bytes(data)
+        temporary.replace(cache_file)
 
     async def enqueue_downloads(self, items: list[dict], directory: str) -> None:
         if not self._queue:

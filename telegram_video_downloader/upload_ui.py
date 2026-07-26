@@ -47,15 +47,24 @@ def human_duration(seconds: float) -> str:
 class UploadManagerDialog(QDialog):
     cancel_requested = Signal(object)
     retry_requested = Signal(object)
-    priority_requested = Signal(object, int)
     pause_requested = Signal()
     refresh_requested = Signal()
     open_cloud_requested = Signal()
 
+    NAME_COLUMN = 0
+    SOURCE_COLUMN = 1
+    STATUS_COLUMN = 2
+    PROGRESS_COLUMN = 3
+    SPEED_COLUMN = 4
+    SIZE_COLUMN = 5
+    ETA_COLUMN = 6
+    RETRY_COLUMN = 7
+    DETAIL_COLUMN = 8
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("上传管理")
-        self.resize(1180, 590)
+        self.resize(1180, 610)
         self._row_by_key: dict[tuple[int, int], int] = {}
         self._states: dict[tuple[int, int], str] = {}
         self._speeds: dict[tuple[int, int], float] = {}
@@ -63,13 +72,13 @@ class UploadManagerDialog(QDialog):
 
         layout = QVBoxLayout(self)
         self.summary = QLabel("暂无上传任务")
+        self.summary.setObjectName("summaryLabel")
         layout.addWidget(self.summary)
-        self.table = QTableWidget(0, 10)
+        self.table = QTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels(
             [
                 "视频名称",
                 "来源",
-                "优先级",
                 "阶段/状态",
                 "进度",
                 "速度",
@@ -80,19 +89,21 @@ class UploadManagerDialog(QDialog):
             ]
         )
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(42)
         self.table.horizontalHeader().setStretchLastSection(True)
-        for column, width in enumerate((250, 130, 70, 110, 130, 95, 155, 85, 55, 300)):
+        for column, width in enumerate((270, 145, 120, 140, 105, 170, 95, 60, 330)):
             self.table.setColumnWidth(column, width)
         layout.addWidget(self.table, 1)
 
         row = QHBoxLayout()
         self.pause_button = QPushButton("暂停上传")
-        self.high_button = QPushButton("优先上传")
-        self.normal_button = QPushButton("普通优先级")
-        self.low_button = QPushButton("低优先级")
         self.cancel_button = QPushButton("取消选中")
         self.retry_button = QPushButton("重试失败/取消")
+        self.retry_button.setObjectName("primaryButton")
         self.clear_button = QPushButton("清理已完成")
         self.local_button = QPushButton("打开本地目录")
         self.cloud_button = QPushButton("打开云端")
@@ -100,9 +111,6 @@ class UploadManagerDialog(QDialog):
         self.close_button = QPushButton("关闭")
         for button in (
             self.pause_button,
-            self.high_button,
-            self.normal_button,
-            self.low_button,
             self.cancel_button,
             self.retry_button,
             self.clear_button,
@@ -116,9 +124,6 @@ class UploadManagerDialog(QDialog):
         layout.addLayout(row)
 
         self.pause_button.clicked.connect(self.pause_requested.emit)
-        self.high_button.clicked.connect(lambda: self._priority(0))
-        self.normal_button.clicked.connect(lambda: self._priority(1))
-        self.low_button.clicked.connect(lambda: self._priority(2))
         self.cancel_button.clicked.connect(self._cancel)
         self.retry_button.clicked.connect(self._retry)
         self.clear_button.clicked.connect(self._clear)
@@ -139,17 +144,22 @@ class UploadManagerDialog(QDialog):
             progress = QProgressBar()
             progress.setRange(0, 100)
             progress.setFormat("%p%")
-            self.table.setCellWidget(row, 4, progress)
-        self.table.item(row, 0).setText(payload.get("name") or Path(payload["file_path"]).name)
-        self.table.item(row, 0).setData(Qt.UserRole, dict(payload))
-        self.table.item(row, 1).setText(payload.get("chat_title", ""))
-        self.table.item(row, 2).setText(self._priority_label(payload.get("priority", 1)))
-        self.table.item(row, 3).setText("等待处理")
-        self.table.item(row, 5).setText("-")
-        self.table.item(row, 6).setText(f"0 B / {human_size(int(payload.get('size', 0)))}")
-        self.table.item(row, 7).setText("-")
-        self.table.item(row, 8).setText(str(payload.get("retry_count", 0)))
-        self.table.item(row, 9).setText(payload.get("file_path", ""))
+            self.table.setCellWidget(row, self.PROGRESS_COLUMN, progress)
+        self.table.item(row, self.NAME_COLUMN).setText(
+            payload.get("name") or Path(payload["file_path"]).name
+        )
+        self.table.item(row, self.NAME_COLUMN).setData(Qt.UserRole, dict(payload))
+        self.table.item(row, self.SOURCE_COLUMN).setText(payload.get("chat_title", ""))
+        self.table.item(row, self.STATUS_COLUMN).setText("等待处理")
+        self.table.item(row, self.SPEED_COLUMN).setText("-")
+        self.table.item(row, self.SIZE_COLUMN).setText(
+            f"0 B / {human_size(int(payload.get('size', 0)))}"
+        )
+        self.table.item(row, self.ETA_COLUMN).setText("-")
+        self.table.item(row, self.RETRY_COLUMN).setText(
+            str(payload.get("retry_count", 0))
+        )
+        self.table.item(row, self.DETAIL_COLUMN).setText(payload.get("file_path", ""))
         self._states[key] = payload.get("status", "queued")
         self._speeds[key] = 0.0
         self._update_summary()
@@ -169,23 +179,23 @@ class UploadManagerDialog(QDialog):
             "remote_missing": "云端已删除",
         }
         self._states[key] = state
-        self.table.item(row, 3).setText(labels.get(state, state))
-        self.table.item(row, 3).setToolTip(detail)
+        self.table.item(row, self.STATUS_COLUMN).setText(labels.get(state, state))
+        self.table.item(row, self.STATUS_COLUMN).setToolTip(detail)
         if detail:
-            self.table.item(row, 9).setText(detail)
-            self.table.item(row, 9).setToolTip(detail)
+            self.table.item(row, self.DETAIL_COLUMN).setText(detail)
+            self.table.item(row, self.DETAIL_COLUMN).setToolTip(detail)
         if state == "completed":
-            self.table.cellWidget(row, 4).setValue(100)
-        if state not in {"uploading"}:
+            self.table.cellWidget(row, self.PROGRESS_COLUMN).setValue(100)
+        if state != "uploading":
             self._speeds[key] = 0.0
-            self.table.item(row, 5).setText("-")
-            self.table.item(row, 7).setText("-")
+            self.table.item(row, self.SPEED_COLUMN).setText("-")
+            self.table.item(row, self.ETA_COLUMN).setText("-")
         self._update_summary()
 
     def update_progress(self, chat_id: int, message_id: int, value: int) -> None:
         row = self._row_by_key.get((int(chat_id), int(message_id)))
         if row is not None:
-            self.table.cellWidget(row, 4).setValue(int(value))
+            self.table.cellWidget(row, self.PROGRESS_COLUMN).setValue(int(value))
 
     def update_metrics(self, chat_id: int, message_id: int, metrics: dict) -> None:
         key = (int(chat_id), int(message_id))
@@ -198,19 +208,20 @@ class UploadManagerDialog(QDialog):
         eta = float(metrics.get("eta", 0))
         phase = str(metrics.get("phase", "sending"))
         self._speeds[key] = speed
-        self.table.item(row, 5).setText(f"{human_size(int(speed))}/s" if speed else "-")
-        self.table.item(row, 6).setText(f"{human_size(current)} / {human_size(total)}")
-        self.table.item(row, 7).setText(human_duration(eta) if eta else "-")
+        self.table.item(row, self.SPEED_COLUMN).setText(
+            f"{human_size(int(speed))}/s" if speed else "-"
+        )
+        self.table.item(row, self.SIZE_COLUMN).setText(
+            f"{human_size(current)} / {human_size(total)}"
+        )
+        self.table.item(row, self.ETA_COLUMN).setText(
+            human_duration(eta) if eta else "-"
+        )
         if phase == "cloud_commit":
-            self.table.item(row, 3).setText("\u4e91\u7aef\u5199\u5165\u4e2d")
+            self.table.item(row, self.STATUS_COLUMN).setText("云端写入中")
         elif self._states.get(key) == "uploading":
-            self.table.item(row, 3).setText("\u4e0a\u4f20\u4e2d")
+            self.table.item(row, self.STATUS_COLUMN).setText("上传中")
         self._update_summary()
-
-    def update_priority(self, chat_id: int, message_id: int, priority: int) -> None:
-        row = self._row_by_key.get((int(chat_id), int(message_id)))
-        if row is not None:
-            self.table.item(row, 2).setText(self._priority_label(priority))
 
     def set_paused(self, paused: bool) -> None:
         self._paused = paused
@@ -219,7 +230,7 @@ class UploadManagerDialog(QDialog):
     def _selected(self) -> list[tuple[int, dict]]:
         result = []
         for index in self.table.selectionModel().selectedRows():
-            payload = self.table.item(index.row(), 0).data(Qt.UserRole)
+            payload = self.table.item(index.row(), self.NAME_COLUMN).data(Qt.UserRole)
             result.append((index.row(), payload))
         return result
 
@@ -233,18 +244,6 @@ class UploadManagerDialog(QDialog):
         keys = self._keys()
         if keys:
             self.cancel_requested.emit(keys)
-
-    def _priority(self, priority: int) -> None:
-        keys = []
-        for row, payload in self._selected():
-            key = (int(payload["chat_id"]), int(payload["message_id"]))
-            if self._states.get(key) == "queued":
-                keys.append(key)
-                payload["priority"] = priority
-                self.table.item(row, 0).setData(Qt.UserRole, payload)
-                self.table.item(row, 2).setText(self._priority_label(priority))
-        if keys:
-            self.priority_requested.emit(keys, priority)
 
     def _retry(self) -> None:
         jobs = []
@@ -267,7 +266,7 @@ class UploadManagerDialog(QDialog):
             self._speeds.pop(key, None)
         self._row_by_key.clear()
         for row in range(self.table.rowCount()):
-            payload = self.table.item(row, 0).data(Qt.UserRole)
+            payload = self.table.item(row, self.NAME_COLUMN).data(Qt.UserRole)
             self._row_by_key[
                 (int(payload["chat_id"]), int(payload["message_id"]))
             ] = row
@@ -280,14 +279,17 @@ class UploadManagerDialog(QDialog):
         path = Path(selected[0][1]["file_path"])
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
 
-    @staticmethod
-    def _priority_label(priority: int) -> str:
-        return {0: "高", 1: "普通", 2: "低"}.get(int(priority), "普通")
-
     def _update_summary(self) -> None:
         counts = {
             state: list(self._states.values()).count(state)
-            for state in ("queued", "processing", "uploading", "completed", "failed", "cancelled")
+            for state in (
+                "queued",
+                "processing",
+                "uploading",
+                "completed",
+                "failed",
+                "cancelled",
+            )
         }
         self.summary.setText(
             "等待 {queued} ｜ 处理中 {processing} ｜ 上传中 {uploading} ｜ "
