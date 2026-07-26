@@ -16,11 +16,11 @@ VSVersionInfo(
         [
           StringStruct(u'CompanyName', u'Local'),
           StringStruct(u'FileDescription', u'Telegram 视频下载与阿里云盘上传工具'),
-          StringStruct(u'FileVersion', u'1.2.0'),
+          StringStruct(u'FileVersion', u'1.2.1'),
           StringStruct(u'InternalName', u'telegram-video-downloader'),
           StringStruct(u'OriginalFilename', u'telegram视频下载器.exe'),
           StringStruct(u'ProductName', u'Telegram 视频下载器'),
-          StringStruct(u'ProductVersion', u'1.2.0')
+          StringStruct(u'ProductVersion', u'1.2.1')
         ]
       )
     ]),

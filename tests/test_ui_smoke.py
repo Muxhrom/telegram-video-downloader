@@ -124,6 +124,9 @@ def test_main_window_starts_and_worker_stops(tmp_path: Path) -> None:
     target = tmp_path / "target.mp4"
     target.write_bytes(b"downloaded")
     window.download_manager.update_state(large_chat_id, video["message_id"], "completed", str(target))
+    window.storage.record_download(large_chat_id, video["message_id"], str(target), target.stat().st_size, "completed")
+    window.select_downloaded_videos()
+    assert window.table.item(0, 0).checkState().name == "Checked"
     compression_requests: list[tuple[list[dict], str]] = []
     window.download_manager.compression_requested.connect(lambda items, profile: compression_requests.append((items, profile)))
     window.download_manager.table.selectRow(0)

@@ -635,6 +635,16 @@ class MainWindow(QMainWindow):
         ):
             action_row.addWidget(button)
         right_layout.addLayout(action_row)
+        bulk_row = QHBoxLayout()
+        bulk_row.addWidget(QLabel("历史下载批量操作"))
+        self.select_downloaded_button = QPushButton("选中已下载")
+        self.compress_all_downloaded_button = QPushButton("压缩全部已下载")
+        self.upload_all_downloaded_button = QPushButton("上传全部已下载")
+        self.refresh_downloaded_button = QPushButton("刷新本地状态")
+        for button in (self.select_downloaded_button, self.compress_all_downloaded_button, self.upload_all_downloaded_button, self.refresh_downloaded_button):
+            bulk_row.addWidget(button)
+        bulk_row.addStretch()
+        right_layout.addLayout(bulk_row)
         self.overall_progress = QProgressBar()
         self.overall_progress.setFormat("当前任务总体进度 %p%")
         right_layout.addWidget(self.overall_progress)
@@ -673,6 +683,10 @@ class MainWindow(QMainWindow):
         self.cancel_button.clicked.connect(self.cancel_selected)
         self.open_button.clicked.connect(self.open_directory)
         self.more_button.clicked.connect(self.load_more)
+        self.select_downloaded_button.clicked.connect(self.select_downloaded_videos)
+        self.compress_all_downloaded_button.clicked.connect(self.compress_all_downloaded)
+        self.upload_all_downloaded_button.clicked.connect(self.upload_all_downloaded)
+        self.refresh_downloaded_button.clicked.connect(self.refresh_all_downloaded_status)
 
     def _build_tray(self) -> None:
         icon = QApplication.windowIcon()
@@ -1060,6 +1074,75 @@ class MainWindow(QMainWindow):
             if item.checkState() == Qt.Checked:
                 result.append(item.data(Qt.UserRole))
         return result
+
+    def _completed_local_items(self) -> list[dict]:
+        """Return every completed local download, including videos outside the loaded history page."""
+        items: list[dict] = []
+        for record in self.storage.completed_downloads():
+            source = Path(str(record.get("file_path", "")))
+            if not source.is_file():
+                continue
+            key = (int(record["chat_id"]), int(record["message_id"]))
+            items.append({
+                "chat_id": key[0], "message_id": key[1],
+                "chat_title": record.get("chat_title") or "历史下载",
+                "name": source.name, "media_kind": "本地视频",
+                "size": source.stat().st_size, "file_path": str(source), "priority": 1,
+            })
+        return items
+
+    def select_downloaded_videos(self) -> None:
+        selected = 0
+        missing = 0
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            video = item.data(Qt.UserRole)
+            key = (int(video["chat_id"]), int(video["message_id"]))
+            record = self.storage.get_download(*key)
+            local = bool(record and record["status"] == "completed" and Path(record["file_path"]).is_file())
+            item.setCheckState(Qt.Checked if local else Qt.Unchecked)
+            if local: selected += 1
+            elif record and record["status"] == "completed": missing += 1
+        message = f"已选中当前页面 {selected} 个本地已下载视频。"
+        if missing: message += f"另有 {missing} 个记录对应的本地文件已不存在。"
+        self.show_notice(message, "success" if selected else "warning")
+
+    def compress_all_downloaded(self) -> None:
+        items = []
+        for item in self._completed_local_items():
+            record = self.storage.get_compression(int(item["chat_id"]), int(item["message_id"]))
+            if record and record["status"] in {"queued", "compressing", "completed"}: continue
+            items.append(item)
+        if not items:
+            self.show_notice("没有可压缩的本地已下载视频（已压缩或文件不存在）。", "warning")
+            return
+        self.compression_worker.submit("enqueue_compressions", items, self.config.compression_profile)
+        self.show_notice(f"已将 {len(items)} 个历史已下载视频加入压缩队列。", "success")
+        self.show_download_manager()
+
+    def upload_all_downloaded(self) -> None:
+        queued = 0
+        for item in self._completed_local_items():
+            key = (int(item["chat_id"]), int(item["message_id"]))
+            uploaded = self.storage.get_upload(*key)
+            if uploaded and uploaded["status"] == "completed": continue
+            self.upload_worker.submit("enqueue_upload", item)
+            queued += 1
+        if not queued:
+            self.show_notice("没有需要上传的历史视频（已上传或本地文件不存在）。", "warning")
+            return
+        self.show_notice(f"已将 {queued} 个历史已下载视频加入上传队列。", "success")
+        self.show_upload_manager()
+
+    def refresh_all_downloaded_status(self) -> None:
+        self.refresh_downloaded_names()
+        visible = 0
+        for row in range(self.table.rowCount()):
+            video = self.table.item(row, 0).data(Qt.UserRole)
+            key = (int(video["chat_id"]), int(video["message_id"]))
+            self.table.item(row, 7).setText(self._download_label(key))
+            if self.storage.get_download(*key): visible += 1
+        self.show_notice(f"已刷新本地下载状态，当前页面匹配到 {visible} 条下载记录。", "success")
 
     def set_visible_checks(self, state: Qt.CheckState) -> None:
         for row in range(self.table.rowCount()):
