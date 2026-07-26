@@ -45,6 +45,7 @@ def test_main_window_starts_and_worker_stops(tmp_path: Path) -> None:
         tools_dir=tmp_path / "data" / "tools",
         openlist_dir=tmp_path / "data" / "tools" / "openlist",
         upload_staging_dir=tmp_path / "data" / "upload_staging",
+        compression_staging_dir=tmp_path / "data" / "compression_staging",
     )
     paths.ensure()
     window = MainWindow(paths, AppConfig())
@@ -120,6 +121,14 @@ def test_main_window_starts_and_worker_stops(tmp_path: Path) -> None:
     assert window.download_manager.acceleration_status.text() == "安全加速已开启"
     window.download_manager.set_acceleration_state(False, "检测到限流，已自动关闭")
     assert not window.download_manager.acceleration_checkbox.isChecked()
+    target = tmp_path / "target.mp4"
+    target.write_bytes(b"downloaded")
+    window.download_manager.update_state(large_chat_id, video["message_id"], "completed", str(target))
+    compression_requests: list[tuple[list[dict], str]] = []
+    window.download_manager.compression_requested.connect(lambda items, profile: compression_requests.append((items, profile)))
+    window.download_manager.table.selectRow(0)
+    window.download_manager._compress_selected()
+    assert compression_requests and compression_requests[-1][0][0]["file_path"] == str(target)
     window.upload_manager.add_job(
         {
             **video,
@@ -143,6 +152,7 @@ def test_main_window_starts_and_worker_stops(tmp_path: Path) -> None:
     ]
     assert window.worker.stop_gracefully()
     assert window.upload_worker.stop_gracefully()
+    assert window.compression_worker.stop_gracefully()
     window.tray.hide()
     window.hide()
     assert not window.worker.isRunning()

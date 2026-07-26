@@ -2,10 +2,11 @@
 
 ## 进程与线程
 
-程序只有一个桌面进程，Qt 主线程负责界面。两个后台工作线程各自维护独立的 asyncio 事件循环：
+程序只有一个桌面进程，Qt 主线程负责界面。三个后台工作线程各自维护独立的 asyncio 事件循环：
 
 - `TelegramWorker`：登录、群聊列表、媒体扫描、下载队列和新增消息监听。
 - `UploadWorker`：FFmpeg 标准化、OpenList 生命周期、WebDAV 查重/上传/校验。
+- `CompressionWorker`：H.265 压缩、FFprobe 校验、压缩队列和上传原文件暂存。
 
 界面通过 Qt Signal 与工作线程交换普通字典和标量。Telegram 的 64 位聊天 ID 使用 `Signal(object)` 传递，避免 Qt 32 位整数截断。
 
@@ -18,6 +19,7 @@
 - `storage.py`：SQLite 表结构与下载/上传/自动规则记录。
 - `telegram_service.py`：Telethon 登录、筛选分页、下载和自动监听。
 - `upload_service.py`：FFmpeg、WebDAV 队列和远端校验。
+- `compression_service.py`：H.265 压缩等级、进度、失败保护和重启恢复。
 - `openlist_manager.py`：OpenList 安装、配置、启动、停止和端口选择。
 - `ui.py`：主界面、登录和下载管理。
 - `upload_ui.py`：云盘设置和上传管理。
@@ -42,6 +44,14 @@
 5. PUT 完成后重新查询远端大小，一致后才记录完成并清理 staging。
 6. 程序不提供删除云端文件的操作。
 
+## 压缩数据流
+
+1. 手动或自动压缩任务进入单文件压缩队列。
+2. FFprobe 读取时长和视频流，FFmpeg 使用 libx265、CRF 20/24/28 和 playable stream 映射。
+3. 输出写入 compression_staging，校验成功且体积变小后原子替换本地文件。
+4. 下载记录保持 completed，压缩记录保存原始和当前文件信息；失败时不删除原视频。
+5. 上传未完成时先暂存原文件，云端上传原始版本，本地保留压缩版本。
+
 OpenList、FFmpeg 工具下载和 WebDAV 客户端均设置 `trust_env=False` 或清除代理环境；Telegram 代理与云盘直连边界不可混用。
 
 ## 持久化结构
@@ -53,6 +63,7 @@ SQLite 包含三张表：
 - `auto_rules`：群聊、启用状态、目录和启用时间。
 - `downloads`：聊天 ID、消息 ID、最终路径、大小和状态。
 - `uploads`：源路径、处理后名称、远端路径、大小、ETag、优先级和状态。
+- `compression_records`：原始路径/大小、当前路径/大小、压缩等级、节省比例、临时文件和状态。
 
 本地文件存在状态是派生信息。删除本地视频不会删除已验证的云端上传记录。
 

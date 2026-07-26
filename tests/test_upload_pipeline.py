@@ -27,6 +27,7 @@ def make_paths(root: Path) -> AppPaths:
         tools_dir=root / "data" / "tools",
         openlist_dir=root / "data" / "tools" / "openlist",
         upload_staging_dir=root / "data" / "upload_staging",
+        compression_staging_dir=root / "data" / "compression_staging",
     )
 
 

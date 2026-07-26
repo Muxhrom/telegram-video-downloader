@@ -19,6 +19,8 @@ class AppConfig:
     openlist_mount: str = "aliyun-drive"
     cloud_root: str = "Telegram视频下载器"
     ffmpeg_path: str = ""
+    auto_compress: bool = False
+    compression_profile: str = "balanced"
 
     @classmethod
     def load(cls, path: Path) -> "AppConfig":

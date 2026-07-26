@@ -56,6 +56,25 @@ class Storage:
                     checked_at TEXT,
                     PRIMARY KEY (chat_id, message_id)
                 );
+                CREATE TABLE IF NOT EXISTS compression_records (
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    original_path TEXT NOT NULL DEFAULT '',
+                    original_size INTEGER NOT NULL DEFAULT 0,
+                    current_path TEXT NOT NULL DEFAULT '',
+                    compressed_size INTEGER NOT NULL DEFAULT 0,
+                    profile TEXT NOT NULL DEFAULT 'balanced',
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    saved_bytes INTEGER NOT NULL DEFAULT 0,
+                    saved_percent REAL NOT NULL DEFAULT 0,
+                    detail TEXT NOT NULL DEFAULT '',
+                    temp_path TEXT NOT NULL DEFAULT '',
+                    snapshot_path TEXT NOT NULL DEFAULT '',
+                    started_at TEXT,
+                    completed_at TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, message_id)
+                );
                 """
             )
 
@@ -133,6 +152,12 @@ class Storage:
             ).fetchone()
         return dict(row) if row else None
 
+    def update_download_file(self, chat_id: int, message_id: int, file_path: str, file_size: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE downloads SET file_path=?, file_size=?, status='completed' WHERE chat_id=? AND message_id=?",
+                (file_path, int(file_size), chat_id, message_id),
+            )
     def completed_downloads(self) -> list[dict]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -241,6 +266,60 @@ class Storage:
                 ),
             )
 
+    def update_upload_source(self, chat_id: int, message_id: int, source_path: str, source_size: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE uploads SET source_path=?, source_size=? WHERE chat_id=? AND message_id=?",
+                (source_path, int(source_size), chat_id, message_id),
+            )
+
+    def get_compression(self, chat_id: int, message_id: int) -> dict | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM compression_records WHERE chat_id=? AND message_id=?",
+                (chat_id, message_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def save_compression_job(self, chat_id: int, message_id: int, original_path: str, original_size: int, profile: str, status: str = 'queued', detail: str = '等待压缩', temp_path: str = '', snapshot_path: str = '') -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO compression_records(chat_id,message_id,original_path,original_size,current_path,profile,status,detail,temp_path,snapshot_path,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(chat_id,message_id) DO UPDATE SET
+                    original_path=excluded.original_path, original_size=excluded.original_size,
+                    profile=excluded.profile, status=excluded.status, detail=excluded.detail,
+                    temp_path=excluded.temp_path, snapshot_path=excluded.snapshot_path, updated_at=excluded.updated_at
+                """,
+                (chat_id, message_id, original_path, int(original_size), original_path, profile, status, detail, temp_path, snapshot_path, now),
+            )
+
+    def update_compression(self, chat_id: int, message_id: int, status: str, detail: str = '', current_path: str = '', compressed_size: int = 0, saved_bytes: int = 0, saved_percent: float = 0.0, temp_path: str = '', snapshot_path: str = '') -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        started = now if status == 'compressing' else None
+        completed = now if status == 'completed' else None
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE compression_records SET status=?, detail=?,
+                    current_path=CASE WHEN ?<>'' THEN ? ELSE current_path END,
+                    compressed_size=CASE WHEN ? > 0 THEN ? ELSE compressed_size END,
+                    saved_bytes=CASE WHEN ? > 0 THEN ? ELSE saved_bytes END,
+                    saved_percent=CASE WHEN ? > 0 THEN ? ELSE saved_percent END,
+                    temp_path=CASE WHEN ?<>'' THEN ? ELSE temp_path END,
+                    snapshot_path=CASE WHEN ?<>'' THEN ? ELSE snapshot_path END,
+                    started_at=COALESCE(?, started_at), completed_at=COALESCE(?, completed_at), updated_at=?
+                WHERE chat_id=? AND message_id=?
+                """,
+                (status, detail, current_path, current_path, compressed_size, compressed_size, saved_bytes, saved_bytes, saved_percent, saved_percent, temp_path, temp_path, snapshot_path, snapshot_path, started, completed, now, chat_id, message_id),
+            )
+
+    def pending_compressions(self) -> list[dict]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM compression_records WHERE status IN ('queued','compressing','failed') ORDER BY rowid").fetchall()
+        return [dict(row) for row in rows]
     def set_upload_priority(
         self, chat_id: int, message_id: int, priority: int
     ) -> None:

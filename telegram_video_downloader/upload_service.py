@@ -154,6 +154,10 @@ class UploadWorker(QObject):
             self.loop.close()
             self.loop = None
 
+    def submit_future(self, method_name: str, *args: Any) -> concurrent.futures.Future | None:
+        if not self.loop or not self.loop.is_running():
+            return None
+        return asyncio.run_coroutine_threadsafe(getattr(self, method_name)(*args), self.loop)
     def submit(self, method_name: str, *args: Any) -> None:
         if not self.loop or not self.loop.is_running():
             self.error.emit("上传工作线程尚未就绪，请稍后重试。")
@@ -235,6 +239,22 @@ class UploadWorker(QObject):
             (int(job["priority"]), self._sequence, self._versions[key], key)
         )
 
+    async def replace_upload_source(self, chat_id: int, message_id: int, source_path: str) -> bool:
+        key = (int(chat_id), int(message_id))
+        if key in self._active:
+            return False
+        source = Path(source_path)
+        if not source.is_file():
+            return False
+        job = self._jobs.get(key)
+        if job is not None:
+            job["file_path"] = str(source)
+            job["size"] = source.stat().st_size
+        record = self.storage.get_upload(*key)
+        if not record or record["status"] not in {"queued", "processing", "cancelled", "failed"}:
+            return False
+        self.storage.update_upload_source(*key, str(source), source.stat().st_size)
+        return True
     async def set_priority(
         self, keys: list[tuple[int, int]], priority: int
     ) -> None:
