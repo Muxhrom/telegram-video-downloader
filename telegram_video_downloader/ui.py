@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
+    QComboBox,
     QDateEdit,
     QDialog,
     QDialogButtonBox,
@@ -38,6 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 from .config import AppConfig
+from .compression_service import PROFILES, CompressionWorker
 from .credentials import delete_api_hash, load_api_hash
 from .naming import sanitize_component
 from .paths import AppPaths
@@ -114,6 +116,10 @@ class DownloadManagerDialog(QDialog):
     pause_requested = Signal()
     acceleration_requested = Signal(bool)
     notice = Signal(str, str)
+    compression_requested = Signal(object, str)
+    compression_pause_requested = Signal()
+    compression_cancel_requested = Signal(object)
+    compression_retry_requested = Signal(object, str)
 
     NAME_COLUMN = 0
     SOURCE_COLUMN = 1
@@ -177,6 +183,11 @@ class DownloadManagerDialog(QDialog):
 
         buttons = QHBoxLayout()
         self.pause_button = QPushButton("暂停队列")
+        self.compression_profile = QComboBox()
+        for key, info in PROFILES.items():
+            self.compression_profile.addItem(info["label"], key)
+        self.compression_button = QPushButton("压缩选中视频")
+        self.compression_pause_button = QPushButton("暂停压缩")
         self.priority_button = QPushButton("优先下载选中任务")
         self.priority_button.setObjectName("primaryButton")
         self.priority_button.setToolTip("将选中的等待任务移动到下载队列前面")
@@ -185,8 +196,12 @@ class DownloadManagerDialog(QDialog):
         self.clear_button = QPushButton("清理已完成")
         self.open_button = QPushButton("打开所在目录")
         self.close_button = QPushButton("关闭")
+        buttons.addWidget(QLabel("压缩等级"))
+        buttons.addWidget(self.compression_profile)
         for button in (
             self.pause_button,
+            self.compression_button,
+            self.compression_pause_button,
             self.priority_button,
             self.cancel_button,
             self.retry_button,
@@ -199,6 +214,8 @@ class DownloadManagerDialog(QDialog):
         layout.addLayout(buttons)
 
         self.pause_button.clicked.connect(self.pause_requested.emit)
+        self.compression_button.clicked.connect(self._compress_selected)
+        self.compression_pause_button.clicked.connect(self.compression_pause_requested.emit)
         self.acceleration_checkbox.toggled.connect(self.acceleration_requested.emit)
         self.priority_button.clicked.connect(self._prioritize_selected)
         self.cancel_button.clicked.connect(self._cancel_selected)
@@ -207,6 +224,17 @@ class DownloadManagerDialog(QDialog):
         self.open_button.clicked.connect(self._open_selected_directory)
         self.close_button.clicked.connect(self.hide)
 
+    def add_compression_job(self, payload: dict) -> None:
+        item = dict(payload)
+        item.setdefault("chat_title", "")
+        item.setdefault("name", Path(item.get("file_path", "视频")).name)
+        wrapper = {"item": item, "directory": str(Path(item["file_path"]).parent), "compression": True}
+        self.add_job(wrapper)
+        key = (int(item["chat_id"]), int(item["message_id"]))
+        row = self._row_by_key.get(key)
+        if row is not None:
+            self._states[key] = "compression_queued"
+            self.table.item(row, self.STATUS_COLUMN).setText("等待压缩")
     def add_job(self, payload: dict) -> None:
         item = payload["item"]
         key = (int(item["chat_id"]), int(item["message_id"]))
@@ -242,10 +270,32 @@ class DownloadManagerDialog(QDialog):
         if row is not None:
             self.table.cellWidget(row, self.PROGRESS_COLUMN).setValue(progress)
 
+    def _compress_selected(self) -> None:
+        items = []
+        for row in self._selected_rows():
+            payload = self.table.item(row, self.NAME_COLUMN).data(Qt.UserRole)
+            item = payload["item"]
+            key = (int(item["chat_id"]), int(item["message_id"]))
+            if self._states.get(key) not in {"completed", "not_smaller", "compression_failed"}:
+                continue
+            path = Path(self.table.item(row, self.PATH_COLUMN).text())
+            if path.is_file():
+                items.append({**item, "file_path": str(path), "size": path.stat().st_size})
+        if not items:
+            self.notice.emit("请选中本地存在且已下载完成的视频。", "warning")
+            return
+        self.compression_requested.emit(items, str(self.compression_profile.currentData()))
     def update_metrics(self, chat_id: int, message_id: int, metrics: dict) -> None:
         key = (int(chat_id), int(message_id))
         row = self._row_by_key.get(key)
         if row is None:
+            return
+        if metrics.get("phase") == "compression":
+            progress = int(metrics.get("progress", 0))
+            self.table.cellWidget(row, self.PROGRESS_COLUMN).setValue(progress)
+            self.table.item(row, self.SIZE_COLUMN).setText(f"压缩中 {progress}%")
+            self.table.item(row, self.SPEED_COLUMN).setText("-")
+            self.table.item(row, self.ETA_COLUMN).setText("-")
             return
         current = int(metrics.get("current", 0))
         total = int(metrics.get("total", 0))
@@ -276,14 +326,19 @@ class DownloadManagerDialog(QDialog):
             "completed": "已完成",
             "failed": "失败",
             "cancelled": "已取消",
+            "compression_queued": "等待压缩",
+            "compressing": "压缩中",
+            "completed_compression": "已压缩",
+            "compression_failed": "压缩失败",
+            "not_smaller": "未变小",
         }
         self._states[key] = state
         status_item = self.table.item(row, self.STATUS_COLUMN)
         status_item.setText(labels.get(state, state))
         status_item.setToolTip(detail)
-        if state in {"downloading", "completed"} and detail:
+        if state in {"downloading", "completed", "completed_compression"} and detail:
             self.table.item(row, self.PATH_COLUMN).setText(detail)
-        if state == "completed":
+        if state in {"completed", "completed_compression"}:
             self.table.cellWidget(row, self.PROGRESS_COLUMN).setValue(100)
         if state != "downloading":
             self._speeds[key] = 0.0
@@ -357,7 +412,7 @@ class DownloadManagerDialog(QDialog):
     def _clear_completed(self) -> None:
         removable = []
         for key, row in self._row_by_key.items():
-            if self._states.get(key) == "completed":
+            if self._states.get(key) in {"completed", "completed_compression"}:
                 removable.append((row, key))
         for row, key in sorted(removable, reverse=True):
             self.table.removeRow(row)
@@ -373,7 +428,7 @@ class DownloadManagerDialog(QDialog):
     def _update_summary(self) -> None:
         counts = {
             state: 0
-            for state in ("queued", "downloading", "completed", "failed", "cancelled")
+            for state in ("queued", "downloading", "completed", "failed", "cancelled", "compression_queued", "compressing", "completed_compression", "compression_failed", "not_smaller")
         }
         for state in self._states.values():
             if state in counts:
@@ -381,7 +436,7 @@ class DownloadManagerDialog(QDialog):
         total_speed = sum(self._speeds.values())
         self.summary_label.setText(
             "等待 {queued} ｜ 下载中 {downloading} ｜ 已完成 {completed} ｜ "
-            "失败 {failed} ｜ 已取消 {cancelled} ｜ 总速度 {speed}/s".format(
+            "失败 {failed} ｜ 已取消 {cancelled} ｜ 压缩中 {compressing} ｜ 已压缩 {completed_compression} ｜ 总速度 {speed}/s".format(
                 **counts,
                 speed=human_size(int(total_speed)),
             )
@@ -400,6 +455,7 @@ class MainWindow(QMainWindow):
         self.storage = Storage(paths.database_file)
         self.worker = TelegramWorker(paths, config)
         self.upload_worker = UploadWorker(paths, config)
+        self.compression_worker = CompressionWorker(paths, config, self.upload_worker)
         self.current_chat: dict | None = None
         self.video_page_state: dict = {}
         self.video_request_id = 0
@@ -428,6 +484,10 @@ class MainWindow(QMainWindow):
             lambda enabled: self.worker.submit("set_acceleration_mode", enabled)
         )
         self.download_manager.notice.connect(self.show_notice)
+        self.download_manager.compression_requested.connect(lambda items, profile: self.compression_worker.submit("enqueue_compressions", items, profile))
+        self.download_manager.compression_pause_requested.connect(self.toggle_compression_pause)
+        self.download_manager.compression_cancel_requested.connect(lambda keys: self.compression_worker.submit("cancel_compressions", keys))
+        self.download_manager.compression_retry_requested.connect(lambda items, profile: self.compression_worker.submit("enqueue_compressions", items, profile))
         self.upload_manager = UploadManagerDialog(self)
         self.cloud_settings = CloudSettingsDialog(config, self)
         self._connect_upload_ui()
@@ -435,6 +495,7 @@ class MainWindow(QMainWindow):
         self._connect_worker()
         self.worker.start()
         self.upload_worker.start()
+        self.compression_worker.start()
         QTimer.singleShot(350, self._auto_connect)
         QTimer.singleShot(
             500, lambda: self.upload_worker.submit("refresh_cloud_state")
@@ -454,6 +515,7 @@ class MainWindow(QMainWindow):
         self.log_button = QPushButton("打开日志")
         self.download_manager_button = QPushButton("下载管理")
         self.upload_manager_button = QPushButton("上传管理")
+        self.compression_button = QPushButton("压缩所选已下载")
         self.cloud_settings_button = QPushButton("云盘设置")
         top.addWidget(self.connection_label)
         top.addStretch()
@@ -461,6 +523,7 @@ class MainWindow(QMainWindow):
         top.addWidget(self.log_button)
         top.addWidget(self.download_manager_button)
         top.addWidget(self.upload_manager_button)
+        top.addWidget(self.compression_button)
         top.addWidget(self.cloud_settings_button)
         top.addWidget(self.login_button)
         top.addWidget(self.logout_button)
@@ -505,11 +568,19 @@ class MainWindow(QMainWindow):
 
         auto_row = QHBoxLayout()
         self.auto_checkbox = QCheckBox("自动下载这个群聊之后出现的新视频")
+        self.auto_compress_checkbox = QCheckBox("下载完成后自动压缩")
+        self.auto_compress_checkbox.setChecked(self.config.auto_compress)
+        self.compression_profile = QComboBox()
+        for key, info in PROFILES.items():
+            self.compression_profile.addItem(info["label"], key)
+        self.compression_profile.setCurrentIndex(max(0, self.compression_profile.findData(self.config.compression_profile)))
         self.directory_edit = QLineEdit()
         self.directory_edit.setReadOnly(True)
         self.directory_button = QPushButton("选择保存目录")
         self.refresh_names_button = QPushButton("刷新已下载标记")
         auto_row.addWidget(self.auto_checkbox)
+        auto_row.addWidget(self.auto_compress_checkbox)
+        auto_row.addWidget(self.compression_profile)
         auto_row.addWidget(self.directory_edit, 1)
         auto_row.addWidget(self.directory_button)
         auto_row.addWidget(self.refresh_names_button)
@@ -546,6 +617,7 @@ class MainWindow(QMainWindow):
         self.download_button = QPushButton("下载所选")
         self.download_button.setObjectName("primaryButton")
         self.upload_button = QPushButton("上传所选已下载")
+        self.compress_selected_button = QPushButton("压缩所选已下载")
         self.pause_button = QPushButton("暂停队列")
         self.cancel_button = QPushButton("取消所选任务")
         self.open_button = QPushButton("打开下载目录")
@@ -555,6 +627,7 @@ class MainWindow(QMainWindow):
             self.invert_button,
             self.download_button,
             self.upload_button,
+            self.compress_selected_button,
             self.pause_button,
             self.cancel_button,
             self.open_button,
@@ -562,6 +635,16 @@ class MainWindow(QMainWindow):
         ):
             action_row.addWidget(button)
         right_layout.addLayout(action_row)
+        bulk_row = QHBoxLayout()
+        bulk_row.addWidget(QLabel("历史下载批量操作"))
+        self.select_downloaded_button = QPushButton("选中已下载")
+        self.compress_all_downloaded_button = QPushButton("压缩全部已下载")
+        self.upload_all_downloaded_button = QPushButton("上传全部已下载")
+        self.refresh_downloaded_button = QPushButton("刷新本地状态")
+        for button in (self.select_downloaded_button, self.compress_all_downloaded_button, self.upload_all_downloaded_button, self.refresh_downloaded_button):
+            bulk_row.addWidget(button)
+        bulk_row.addStretch()
+        right_layout.addLayout(bulk_row)
         self.overall_progress = QProgressBar()
         self.overall_progress.setFormat("当前任务总体进度 %p%")
         right_layout.addWidget(self.overall_progress)
@@ -578,6 +661,8 @@ class MainWindow(QMainWindow):
         self.log_button.clicked.connect(self.open_log_directory)
         self.download_manager_button.clicked.connect(self.show_download_manager)
         self.upload_manager_button.clicked.connect(self.show_upload_manager)
+        self.compression_button.clicked.connect(self.compression_selected)
+        self.compress_selected_button.clicked.connect(self.compression_selected)
         self.cloud_settings_button.clicked.connect(self.show_cloud_settings)
         self.chat_search.textChanged.connect(self.filter_chats)
         self.chat_list.currentItemChanged.connect(self.chat_changed)
@@ -588,6 +673,8 @@ class MainWindow(QMainWindow):
         self.directory_button.clicked.connect(self.choose_directory)
         self.refresh_names_button.clicked.connect(self.refresh_downloaded_names)
         self.auto_checkbox.toggled.connect(self.save_auto_rule)
+        self.auto_compress_checkbox.toggled.connect(self.save_compression_settings)
+        self.compression_profile.currentIndexChanged.connect(self.save_compression_settings)
         self.select_all_button.clicked.connect(lambda: self.set_visible_checks(Qt.Checked))
         self.invert_button.clicked.connect(self.invert_checks)
         self.download_button.clicked.connect(self.download_selected)
@@ -596,6 +683,10 @@ class MainWindow(QMainWindow):
         self.cancel_button.clicked.connect(self.cancel_selected)
         self.open_button.clicked.connect(self.open_directory)
         self.more_button.clicked.connect(self.load_more)
+        self.select_downloaded_button.clicked.connect(self.select_downloaded_videos)
+        self.compress_all_downloaded_button.clicked.connect(self.compress_all_downloaded)
+        self.upload_all_downloaded_button.clicked.connect(self.upload_all_downloaded)
+        self.refresh_downloaded_button.clicked.connect(self.refresh_all_downloaded_status)
 
     def _build_tray(self) -> None:
         icon = QApplication.windowIcon()
@@ -643,6 +734,12 @@ class MainWindow(QMainWindow):
         )
         self.worker.downloaded_names_ready.connect(self.set_downloaded_names)
         self.worker.connection_changed.connect(self.set_connection)
+        self.compression_worker.status.connect(self.show_notice)
+        self.compression_worker.error.connect(self.show_error)
+        self.compression_worker.compression_job.connect(self.download_manager.add_compression_job)
+        self.compression_worker.compression_state.connect(self.update_compression_state)
+        self.compression_worker.compression_progress.connect(self.download_manager.update_progress)
+        self.compression_worker.compression_metrics.connect(self.download_manager.update_metrics)
 
     def _connect_upload_ui(self) -> None:
         self.upload_manager.cancel_requested.connect(
@@ -978,6 +1075,75 @@ class MainWindow(QMainWindow):
                 result.append(item.data(Qt.UserRole))
         return result
 
+    def _completed_local_items(self) -> list[dict]:
+        """Return every completed local download, including videos outside the loaded history page."""
+        items: list[dict] = []
+        for record in self.storage.completed_downloads():
+            source = Path(str(record.get("file_path", "")))
+            if not source.is_file():
+                continue
+            key = (int(record["chat_id"]), int(record["message_id"]))
+            items.append({
+                "chat_id": key[0], "message_id": key[1],
+                "chat_title": record.get("chat_title") or "历史下载",
+                "name": source.name, "media_kind": "本地视频",
+                "size": source.stat().st_size, "file_path": str(source), "priority": 1,
+            })
+        return items
+
+    def select_downloaded_videos(self) -> None:
+        selected = 0
+        missing = 0
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            video = item.data(Qt.UserRole)
+            key = (int(video["chat_id"]), int(video["message_id"]))
+            record = self.storage.get_download(*key)
+            local = bool(record and record["status"] == "completed" and Path(record["file_path"]).is_file())
+            item.setCheckState(Qt.Checked if local else Qt.Unchecked)
+            if local: selected += 1
+            elif record and record["status"] == "completed": missing += 1
+        message = f"已选中当前页面 {selected} 个本地已下载视频。"
+        if missing: message += f"另有 {missing} 个记录对应的本地文件已不存在。"
+        self.show_notice(message, "success" if selected else "warning")
+
+    def compress_all_downloaded(self) -> None:
+        items = []
+        for item in self._completed_local_items():
+            record = self.storage.get_compression(int(item["chat_id"]), int(item["message_id"]))
+            if record and record["status"] in {"queued", "compressing", "completed"}: continue
+            items.append(item)
+        if not items:
+            self.show_notice("没有可压缩的本地已下载视频（已压缩或文件不存在）。", "warning")
+            return
+        self.compression_worker.submit("enqueue_compressions", items, self.config.compression_profile)
+        self.show_notice(f"已将 {len(items)} 个历史已下载视频加入压缩队列。", "success")
+        self.show_download_manager()
+
+    def upload_all_downloaded(self) -> None:
+        queued = 0
+        for item in self._completed_local_items():
+            key = (int(item["chat_id"]), int(item["message_id"]))
+            uploaded = self.storage.get_upload(*key)
+            if uploaded and uploaded["status"] == "completed": continue
+            self.upload_worker.submit("enqueue_upload", item)
+            queued += 1
+        if not queued:
+            self.show_notice("没有需要上传的历史视频（已上传或本地文件不存在）。", "warning")
+            return
+        self.show_notice(f"已将 {queued} 个历史已下载视频加入上传队列。", "success")
+        self.show_upload_manager()
+
+    def refresh_all_downloaded_status(self) -> None:
+        self.refresh_downloaded_names()
+        visible = 0
+        for row in range(self.table.rowCount()):
+            video = self.table.item(row, 0).data(Qt.UserRole)
+            key = (int(video["chat_id"]), int(video["message_id"]))
+            self.table.item(row, 7).setText(self._download_label(key))
+            if self.storage.get_download(*key): visible += 1
+        self.show_notice(f"已刷新本地下载状态，当前页面匹配到 {visible} 条下载记录。", "success")
+
     def set_visible_checks(self, state: Qt.CheckState) -> None:
         for row in range(self.table.rowCount()):
             if not self.table.isRowHidden(row):
@@ -1099,6 +1265,11 @@ class MainWindow(QMainWindow):
             "completed": "已完成",
             "failed": "失败",
             "cancelled": "已取消",
+            "compression_queued": "等待压缩",
+            "compressing": "压缩中",
+            "completed_compression": "已压缩",
+            "compression_failed": "压缩失败",
+            "not_smaller": "未变小",
         }
         if row is not None:
             self.table.item(row, 7).setText(labels.get(state, state))
@@ -1106,6 +1277,7 @@ class MainWindow(QMainWindow):
         self.download_manager.update_state(chat_id, message_id, state, detail)
         if state == "completed":
             completed = Path(detail)
+            video = dict(self.table.item(row, 0).data(Qt.UserRole)) if row is not None else {"chat_id": chat_id, "message_id": message_id, "name": completed.name, "chat_title": ""}
             if completed.is_file():
                 self._existing_names.add(completed.name.casefold())
                 self._apply_existing_marks()
@@ -1124,9 +1296,58 @@ class MainWindow(QMainWindow):
                             "priority": 1,
                         },
                     )
+                if self.config.auto_compress:
+                    self.compression_worker.submit("enqueue_compressions", [{**video, "file_path": str(completed), "size": completed.stat().st_size}], self.config.compression_profile)
         if state == "failed":
             self.show_notice(f"下载失败：{detail}", "error", 12000)
 
+    def compression_selected(self) -> None:
+        items = []
+        for video in self.selected_videos():
+            key = (int(video["chat_id"]), int(video["message_id"]))
+            record = self.storage.get_download(*key)
+            if not record or record["status"] != "completed":
+                continue
+            source = Path(record["file_path"])
+            if source.is_file():
+                items.append({**video, "file_path": str(source), "size": source.stat().st_size})
+        if not items:
+            self.show_notice("所选视频尚未下载，或本地文件已经被删除。", "warning")
+            return
+        self.compression_worker.submit("enqueue_compressions", items, self.config.compression_profile)
+        self.show_download_manager()
+
+    def save_compression_settings(self) -> None:
+        self.config.auto_compress = self.auto_compress_checkbox.isChecked()
+        self.config.compression_profile = str(self.compression_profile.currentData() or "balanced")
+        self.config.save(self.paths.config_file)
+
+    def toggle_compression_pause(self) -> None:
+        paused = getattr(self, "compression_paused", False)
+        self.compression_paused = not paused
+        self.compression_worker.submit("set_paused", self.compression_paused)
+        self.download_manager.compression_pause_button.setText("恢复压缩" if self.compression_paused else "暂停压缩")
+
+    def update_compression_state(self, chat_id: int, message_id: int, state: str, detail: str) -> None:
+        key = (int(chat_id), int(message_id))
+        row = self._row_by_key.get(key)
+        labels = {
+            "queued": "等待压缩",
+            "compressing": "压缩中",
+            "completed": "已下载 / 已压缩",
+            "failed": "压缩失败",
+            "cancelled": "压缩已取消",
+            "not_smaller": "压缩结果未变小",
+        }
+        if row is not None:
+            self.table.item(row, 7).setText(labels.get(state, state))
+            self.table.item(row, 7).setToolTip(detail)
+        manager_state = {"completed": "completed_compression", "failed": "compression_failed"}.get(state, "compression_queued" if state == "queued" else state)
+        self.download_manager.update_state(chat_id, message_id, manager_state, detail)
+        if state == "failed":
+            self.show_notice(f"视频压缩失败：{detail}", "error", 12000)
+        elif state == "completed":
+            self.show_notice("视频压缩完成，原视频已删除。", "success")
     def retry_downloads(self, jobs: list[dict]) -> None:
         for job in jobs:
             item = dict(job["item"])
@@ -1201,7 +1422,12 @@ class MainWindow(QMainWindow):
         record = self.storage.get_download(*key)
         if not record or record["status"] != "completed":
             return "未下载"
-        return "本地存在" if Path(record["file_path"]).is_file() else "本地已删除"
+        if not Path(record["file_path"]).is_file():
+            return "本地已删除"
+        compression = self.storage.get_compression(*key)
+        if compression and compression["status"] == "completed":
+            return "本地存在 / 已压缩"
+        return "本地存在"
 
     def refresh_cloud_upload_status(self) -> None:
         keys = list(self._row_by_key.keys())
@@ -1344,5 +1570,7 @@ class MainWindow(QMainWindow):
             self.worker.stop_gracefully()
         if self.upload_worker.isRunning():
             self.upload_worker.stop_gracefully()
+        if self.compression_worker.is_running():
+            self.compression_worker.stop_gracefully()
         self.tray.hide()
         QApplication.quit()

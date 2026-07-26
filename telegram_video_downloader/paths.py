@@ -19,6 +19,7 @@ class AppPaths:
     tools_dir: Path
     openlist_dir: Path
     upload_staging_dir: Path
+    compression_staging_dir: Path
 
     @classmethod
     def discover(cls) -> "AppPaths":
@@ -37,6 +38,7 @@ class AppPaths:
             tools_dir=data_dir / "tools",
             openlist_dir=data_dir / "tools" / "openlist",
             upload_staging_dir=data_dir / "upload_staging",
+            compression_staging_dir=data_dir / "compression_staging",
         )
 
     def ensure(self) -> None:
@@ -45,3 +47,4 @@ class AppPaths:
         self.tools_dir.mkdir(parents=True, exist_ok=True)
         self.openlist_dir.mkdir(parents=True, exist_ok=True)
         self.upload_staging_dir.mkdir(parents=True, exist_ok=True)
+        self.compression_staging_dir.mkdir(parents=True, exist_ok=True)

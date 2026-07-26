@@ -10,6 +10,8 @@ Windows 桌面程序：使用 Telegram 用户账号浏览群聊、超级群组�
 - 每个群聊可独立开启新增视频自动下载；历史记录按群聊 ID 和消息 ID 去重。
 - 下载目录同名比对，已存在的视频会在主列表中变灰标注。
 - 上传管理窗口提供 FFmpeg 处理、WebDAV 上传、远端校验和重试。
+- 下载管理支持 H.265 压缩：高质量 CRF 20、平衡 CRF 24、强压缩 CRF 28；支持手动压缩和下载完成后自动压缩。压缩成功并校验后删除本地原视频，下载记录仍按群聊 ID + 消息 ID 保持已下载状态。
+- 主界面提供“选中已下载”“压缩全部已下载”“上传全部已下载”和“刷新本地状态”，重启后可直接按本地下载记录批量处理，不必逐条翻页勾选。
 - OpenList/阿里云盘通信直接联网，不使用 Telegram 的 Clash 代理。
 - 窗口关闭后留在系统托盘，选择“彻底退出”才停止后台任务。
 
@@ -60,6 +62,8 @@ Set-Location -LiteralPath '<项目目录>'
 
 上传前 FFmpeg 使用 `-c copy` 保留音视频流，只执行容器与元数据标准化。此功能用于文件整理和兼容性，不用于规避云盘审核。OpenList、FFmpeg 下载和云盘上传默认直接联网；仅 Telegram 使用 `127.0.0.1:7890`。
 
+压缩使用 FFmpeg `libx265` 软件编码，音频和字幕尽量直接复制。输出经 FFprobe 校验，若失败或压缩后没有变小则保留原文件。上传尚未完成时，程序会暂存原视频供云端上传，本地继续保留压缩后的版本。
+
 ## 本地数据与隐私
 
 用户数据不保存在仓库或 EXE 旁边：
@@ -68,6 +72,7 @@ Set-Location -LiteralPath '<项目目录>'
 - 默认视频目录：`%USERPROFILE%\Downloads\Telegram Video Downloader`
 - API Hash 与 OpenList 管理员密码：Windows 凭据管理器
 - 上传临时文件：`%LOCALAPPDATA%\TelegramVideoDownloader\upload_staging`
+- 压缩临时文件：`%LOCALAPPDATA%\TelegramVideoDownloader\compression_staging`
 
 不要提交或分享 `telegram.session`、`state.sqlite3`、`config.json`、日志、OpenList `data` 目录或下载的视频。更完整的边界说明见 [PRIVACY.md](PRIVACY.md)。
 
