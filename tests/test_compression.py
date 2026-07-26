@@ -65,6 +65,7 @@ def test_compression_profile_maps_to_x265_crf(tmp_path: Path, monkeypatch: pytes
     storage.record_download(-100, 1, str(source), source.stat().st_size, "completed")
     worker = CompressionWorker(paths, AppConfig(ffmpeg_path=str(tmp_path / "ffmpeg.exe")))
     (tmp_path / "ffmpeg.exe").write_bytes(b"fake")
+    (tmp_path / "ffprobe.exe").write_bytes(b"fake")
     storage.save_compression_job(-100, 1, str(source), 100, profile)
     worker._probe = lambda probe, path: asyncio.sleep(0, result=(1.0, True))  # type: ignore[method-assign]
 
@@ -107,6 +108,7 @@ def test_compression_keeps_original_when_result_is_not_smaller(tmp_path: Path, m
     storage.record_download(-100, 3, str(source), source.stat().st_size, "completed")
     worker = CompressionWorker(paths, AppConfig(ffmpeg_path=str(tmp_path / "ffmpeg.exe")))
     (tmp_path / "ffmpeg.exe").write_bytes(b"fake")
+    (tmp_path / "ffprobe.exe").write_bytes(b"fake")
     storage.save_compression_job(-100, 3, str(source), 40, "balanced")
     worker._probe = lambda probe, path: asyncio.sleep(0, result=(1.0, True))  # type: ignore[method-assign]
 
