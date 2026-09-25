@@ -177,6 +177,7 @@ class UploadManagerDialog(QDialog):
             "failed": "失败",
             "cancelled": "已取消",
             "remote_missing": "云端已删除",
+            "needs_review": "疑似重复·待确认",
         }
         self._states[key] = state
         self.table.item(row, self.STATUS_COLUMN).setText(labels.get(state, state))

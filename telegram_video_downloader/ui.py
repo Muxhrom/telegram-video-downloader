@@ -39,8 +39,11 @@ from PySide6.QtWidgets import (
 )
 
 from .config import AppConfig
+from .cloud_catalog import classify_cloud_video
+from .cloud_ui import CloudLibraryDialog
 from .compression_service import PROFILES, CompressionWorker
 from .credentials import delete_api_hash, load_api_hash
+from .library import LibraryStore
 from .naming import sanitize_component
 from .paths import AppPaths
 from .proxy import proxy_available
@@ -453,6 +456,7 @@ class MainWindow(QMainWindow):
         self.paths = paths
         self.config = config
         self.storage = Storage(paths.database_file)
+        self.library = LibraryStore(paths.database_file)
         self.worker = TelegramWorker(paths, config)
         self.upload_worker = UploadWorker(paths, config)
         self.compression_worker = CompressionWorker(paths, config, self.upload_worker)
@@ -468,8 +472,15 @@ class MainWindow(QMainWindow):
         self._progress_by_key: dict[tuple[int, int], int] = {}
         self._directory_scan_id = 0
         self._existing_names: set[str] = set()
+        self._telegram_ready = False
+        self._refresh_in_progress = False
+        self._cloud_files = self.library.cloud_files()
+        self._cloud_verified = False
+        self._cloud_review: dict[tuple[int, int], dict] = {}
+        self._rename_probe_ok = False
         self._build_ui()
         self.download_manager = DownloadManagerDialog(self)
+        self._restore_download_manager_tasks()
         self.download_manager.cancel_requested.connect(
             lambda keys: self.worker.submit("cancel_downloads", keys)
         )
@@ -489,10 +500,13 @@ class MainWindow(QMainWindow):
         self.download_manager.compression_cancel_requested.connect(lambda keys: self.compression_worker.submit("cancel_compressions", keys))
         self.download_manager.compression_retry_requested.connect(lambda items, profile: self.compression_worker.submit("enqueue_compressions", items, profile))
         self.upload_manager = UploadManagerDialog(self)
+        self._restore_upload_manager_tasks()
+        self.cloud_library = CloudLibraryDialog(paths, self.storage, self.library, self)
         self.cloud_settings = CloudSettingsDialog(config, self)
         self._connect_upload_ui()
         self._build_tray()
         self._connect_worker()
+        self.set_chats(self.library.chats(), from_cache=True)
         self.worker.start()
         self.upload_worker.start()
         self.compression_worker.start()
@@ -517,6 +531,7 @@ class MainWindow(QMainWindow):
         self.upload_manager_button = QPushButton("上传管理")
         self.compression_button = QPushButton("压缩所选已下载")
         self.cloud_settings_button = QPushButton("云盘设置")
+        self.cloud_library_button = QPushButton("云盘清单")
         top.addWidget(self.connection_label)
         top.addStretch()
         top.addWidget(self.proxy_button)
@@ -525,6 +540,7 @@ class MainWindow(QMainWindow):
         top.addWidget(self.upload_manager_button)
         top.addWidget(self.compression_button)
         top.addWidget(self.cloud_settings_button)
+        top.addWidget(self.cloud_library_button)
         top.addWidget(self.login_button)
         top.addWidget(self.logout_button)
         outer.addLayout(top)
@@ -565,6 +581,15 @@ class MainWindow(QMainWindow):
         filter_row.addWidget(QLabel("到"))
         filter_row.addWidget(self.date_to)
         right_layout.addLayout(filter_row)
+
+        library_row = QHBoxLayout()
+        self.refresh_videos_button = QPushButton("检查新视频")
+        self.rescan_videos_button = QPushButton("重新核对历史")
+        self.cache_status_label = QLabel("尚无视频缓存")
+        library_row.addWidget(self.refresh_videos_button)
+        library_row.addWidget(self.rescan_videos_button)
+        library_row.addWidget(self.cache_status_label, 1)
+        right_layout.addLayout(library_row)
 
         auto_row = QHBoxLayout()
         self.auto_checkbox = QCheckBox("自动下载这个群聊之后出现的新视频")
@@ -616,6 +641,7 @@ class MainWindow(QMainWindow):
         self.invert_button = QPushButton("反选")
         self.download_button = QPushButton("下载所选")
         self.download_button.setObjectName("primaryButton")
+        self.redownload_button = QPushButton("重新下载所选")
         self.upload_button = QPushButton("上传所选已下载")
         self.compress_selected_button = QPushButton("压缩所选已下载")
         self.pause_button = QPushButton("暂停队列")
@@ -626,6 +652,7 @@ class MainWindow(QMainWindow):
             self.select_all_button,
             self.invert_button,
             self.download_button,
+            self.redownload_button,
             self.upload_button,
             self.compress_selected_button,
             self.pause_button,
@@ -664,6 +691,7 @@ class MainWindow(QMainWindow):
         self.compression_button.clicked.connect(self.compression_selected)
         self.compress_selected_button.clicked.connect(self.compression_selected)
         self.cloud_settings_button.clicked.connect(self.show_cloud_settings)
+        self.cloud_library_button.clicked.connect(self.show_cloud_library)
         self.chat_search.textChanged.connect(self.filter_chats)
         self.chat_list.currentItemChanged.connect(self.chat_changed)
         self.video_search.textChanged.connect(self.filter_videos)
@@ -678,11 +706,14 @@ class MainWindow(QMainWindow):
         self.select_all_button.clicked.connect(lambda: self.set_visible_checks(Qt.Checked))
         self.invert_button.clicked.connect(self.invert_checks)
         self.download_button.clicked.connect(self.download_selected)
+        self.redownload_button.clicked.connect(self.redownload_selected)
         self.upload_button.clicked.connect(self.upload_selected)
         self.pause_button.clicked.connect(self.toggle_pause)
         self.cancel_button.clicked.connect(self.cancel_selected)
         self.open_button.clicked.connect(self.open_directory)
         self.more_button.clicked.connect(self.load_more)
+        self.refresh_videos_button.clicked.connect(self.refresh_new_videos)
+        self.rescan_videos_button.clicked.connect(self.rescan_history)
         self.select_downloaded_button.clicked.connect(self.select_downloaded_videos)
         self.compress_all_downloaded_button.clicked.connect(self.compress_all_downloaded)
         self.upload_all_downloaded_button.clicked.connect(self.upload_all_downloaded)
@@ -723,6 +754,8 @@ class MainWindow(QMainWindow):
         self.worker.auth_state.connect(self.handle_auth_state)
         self.worker.chats_ready.connect(self.set_chats)
         self.worker.videos_ready.connect(self.add_videos)
+        self.worker.new_videos_ready.connect(self.show_new_videos)
+        self.worker.history_rechecked.connect(self.show_rechecked_history)
         self.worker.video_scan_status.connect(self.set_video_scan_status)
         self.worker.download_progress.connect(self.update_download_progress)
         self.worker.download_metrics.connect(self.download_manager.update_metrics)
@@ -767,6 +800,19 @@ class MainWindow(QMainWindow):
         self.cloud_settings.supplement_requested.connect(
             self.supplement_completed_downloads
         )
+        self.cloud_library.scan_requested.connect(self.supplement_completed_downloads)
+        self.cloud_library.confirm_requested.connect(
+            lambda item: self.upload_worker.submit("confirm_cloud_match", item)
+        )
+        self.cloud_library.override_requested.connect(
+            lambda item: self.upload_worker.submit("enqueue_upload", {**item, "cloud_override": True})
+        )
+        self.cloud_library.probe_requested.connect(
+            lambda: self.upload_worker.submit("probe_cloud_rename")
+        )
+        self.cloud_library.plan_requested.connect(
+            lambda: self.upload_worker.submit("plan_cloud_renames")
+        )
         self.cloud_settings.saved.connect(self.save_cloud_settings)
         self.cloud_settings.password_change_requested.connect(
             lambda password: self.upload_worker.submit(
@@ -781,6 +827,11 @@ class MainWindow(QMainWindow):
         self.upload_worker.upload_progress.connect(self.upload_manager.update_progress)
         self.upload_worker.upload_metrics.connect(self.upload_manager.update_metrics)
         self.upload_worker.cloud_state.connect(self.cloud_settings.set_state)
+        self.upload_worker.cloud_inventory_ready.connect(self.set_cloud_inventory)
+        self.upload_worker.review_needed.connect(self.set_cloud_review)
+        self.upload_worker.rename_plan_ready.connect(self.show_cloud_rename_plan)
+        self.upload_worker.rename_probe_result.connect(self.show_cloud_rename_probe)
+        self.upload_worker.rename_result.connect(self.show_cloud_rename_result)
 
     def _auto_connect(self) -> None:
         api_hash = load_api_hash()
@@ -822,19 +873,85 @@ class MainWindow(QMainWindow):
             self._row_by_key.clear()
 
     def set_connection(self, connected: bool, text: str) -> None:
+        if not connected:
+            self._telegram_ready = False
         color = "#16803a" if connected else "#b42318"
         self.connection_label.setText(f"● {text}")
         self.connection_label.setStyleSheet(f"color: {color}; font-weight: bold")
         self.tray.setToolTip(f"Telegram 视频下载器 - {text}")
         self.tray_status_action.setText(f"状态：{text}")
 
-    def set_chats(self, chats: list[dict]) -> None:
+    def _restore_download_manager_tasks(self) -> None:
+        for task in self.library.download_tasks():
+            item = task["item"]
+            self.download_manager.add_job({
+                "item": item, "directory": task["directory"],
+                "priority": int(task["priority"]),
+            })
+            state = task["status"]
+            if state == "downloading":
+                state = "queued"
+            detail = task["detail"]
+            if state == "completed":
+                record = self.storage.get_download(int(item["chat_id"]), int(item["message_id"]))
+                detail = str(record["file_path"]) if record else ""
+            self.download_manager.update_state(
+                int(item["chat_id"]), int(item["message_id"]), state, detail,
+            )
+
+    def _restore_upload_manager_tasks(self) -> None:
+        for record in [*self.storage.pending_uploads(), *self.storage.completed_uploads()]:
+            item = {
+                **record,
+                "name": Path(record["source_path"]).name,
+                "file_path": record["source_path"],
+                "size": int(record["source_size"]),
+            }
+            self.upload_manager.add_job(item)
+            state = record["status"]
+            if state in {"uploading", "processing"}:
+                state = "queued"
+            self.upload_manager.update_state(
+                int(record["chat_id"]), int(record["message_id"]),
+                state, record["detail"],
+            )
+
+    def set_chats(self, chats: list[dict], from_cache: bool = False) -> None:
+        displayed_chat = int(self.current_chat["chat_id"]) if self.current_chat else 0
+        selected = (
+            int(self.current_chat["chat_id"])
+            if self.current_chat else int(self.library.get_state("last_chat_id", "0"))
+        )
+        if not from_cache:
+            self.library.save_chats(chats)
+            self._telegram_ready = True
+            self.upload_worker.submit("reconcile_local_downloads")
+        self.chat_list.blockSignals(True)
         self.chat_list.clear()
+        selected_row = -1
         for chat in chats:
             item = QListWidgetItem(f"{chat['title']}  ·  {chat['kind']}")
             item.setData(Qt.UserRole, chat)
             self.chat_list.addItem(item)
-        self.show_notice(f"已载入 {len(chats)} 个群聊/频道。", "success")
+            if int(chat["chat_id"]) == selected:
+                selected_row = self.chat_list.count() - 1
+        if selected_row >= 0:
+            self.chat_list.setCurrentRow(selected_row)
+        self.chat_list.blockSignals(False)
+        if selected_row >= 0:
+            selected_item = self.chat_list.currentItem()
+            if displayed_chat != selected:
+                self.chat_changed(selected_item, None)
+            else:
+                self.current_chat = selected_item.data(Qt.UserRole)
+                if not from_cache:
+                    if self.library.newest_message_id(selected):
+                        self.refresh_new_videos()
+                    else:
+                        self.load_more()
+        if chats:
+            origin = "缓存" if from_cache else "Telegram"
+            self.show_notice(f"已从{origin}载入 {len(chats)} 个群聊/频道。", "success")
 
     def filter_chats(self, text: str) -> None:
         needle = text.casefold().strip()
@@ -847,22 +964,97 @@ class MainWindow(QMainWindow):
         if not current:
             return
         self.current_chat = current.data(Qt.UserRole)
+        chat_id = int(self.current_chat["chat_id"])
+        self.library.set_state("last_chat_id", str(chat_id))
         self.video_request_id += 1
         self.video_search.clear()
         self.table.setRowCount(0)
         self._row_by_key.clear()
         self._progress_by_key.clear()
-        self.video_page_state = {}
-        self.reached_end = False
+        self.video_page_state = self.library.scan_state(chat_id)
+        self.reached_end = bool(self.video_page_state.get("reached_end", False))
         self._scan_in_progress = False
+        self._refresh_in_progress = False
         rule = self.storage.get_rule(self.current_chat["chat_id"])
         default_dir = self.paths.default_download_dir / sanitize_component(self.current_chat["title"])
         self.directory_edit.setText(rule["directory"] if rule else str(default_dir))
         self.auto_checkbox.blockSignals(True)
         self.auto_checkbox.setChecked(bool(rule and rule["enabled"]))
         self.auto_checkbox.blockSignals(False)
-        self.refresh_downloaded_names()
-        self.load_more()
+        cached = self.library.videos(chat_id)
+        if cached:
+            self.add_videos(self.video_request_id, chat_id, cached, {}, False, from_cache=True)
+        checked_at = self.library.checked_at(chat_id)
+        self.cache_status_label.setText(
+            f"缓存 {len(cached)} 个视频 · 最近核对 {checked_at[:16].replace('T', ' ')}"
+            if checked_at else f"缓存 {len(cached)} 个视频 · 尚未核对新增"
+        )
+        self.more_button.setEnabled(not self.reached_end)
+        self.more_button.setText("已到最早视频" if self.reached_end else "加载更多")
+        if self.worker.isRunning():
+            self.refresh_downloaded_names()
+        if self._telegram_ready:
+            if cached:
+                self.refresh_new_videos()
+            else:
+                self.load_more()
+
+    def refresh_new_videos(self) -> None:
+        if not self.current_chat or self._refresh_in_progress or self._scan_in_progress:
+            return
+        if not self._telegram_ready:
+            self.show_notice("当前离线，已显示上次保存的视频列表。", "warning")
+            return
+        chat_id = int(self.current_chat["chat_id"])
+        if not self.library.newest_message_id(chat_id):
+            self.load_more()
+            return
+        self._refresh_in_progress = True
+        self.refresh_videos_button.setEnabled(False)
+        self.cache_status_label.setText("正在检查新视频…")
+        self.worker.submit(
+            "refresh_new_videos", self.video_request_id, chat_id,
+            self.library.newest_message_id(chat_id),
+        )
+
+    def show_new_videos(self, request_id: int, chat_id: int, videos: list[dict], error: str) -> None:
+        if not self.current_chat or request_id != self.video_request_id or chat_id != self.current_chat["chat_id"]:
+            return
+        self._refresh_in_progress = False
+        self.refresh_videos_button.setEnabled(True)
+        if error:
+            self.cache_status_label.setText("新视频检查失败，缓存仍可用")
+            self.show_notice(f"检查新视频失败：{error}", "warning")
+            return
+        self.add_videos(request_id, chat_id, videos, {}, False)
+        self.cache_status_label.setText(f"已核对新增 · 当前缓存 {self.table.rowCount()} 个视频")
+        self.show_notice(f"发现 {len(videos)} 个新视频。" if videos else "没有新视频。", "success")
+
+    def rescan_history(self) -> None:
+        if not self.current_chat or self._scan_in_progress or self._refresh_in_progress:
+            return
+        if not self._telegram_ready:
+            self.show_notice("Telegram 未连接，暂时无法核对历史。", "warning")
+            return
+        self._scan_in_progress = True
+        self.rescan_videos_button.setEnabled(False)
+        self.worker.submit("recheck_history", self.video_request_id, int(self.current_chat["chat_id"]))
+
+    def show_rechecked_history(
+        self, request_id: int, chat_id: int, videos: list[dict], state: dict, error: str,
+    ) -> None:
+        if not self.current_chat or request_id != self.video_request_id or chat_id != self.current_chat["chat_id"]:
+            return
+        self._scan_in_progress = False
+        self.rescan_videos_button.setEnabled(True)
+        if error:
+            self.show_notice(f"历史核对失败：{error}；原缓存未改变。", "warning")
+            return
+        self.table.setRowCount(0)
+        self._row_by_key.clear()
+        self.add_videos(request_id, chat_id, videos, state, True, from_cache=True)
+        self.cache_status_label.setText(f"历史核对完成 · {len(videos)} 个视频")
+        self.show_notice(f"历史核对完成：{len(videos)} 个视频。", "success")
 
     def load_more(self) -> None:
         if not self.current_chat or self.reached_end or self._scan_in_progress:
@@ -886,6 +1078,7 @@ class MainWindow(QMainWindow):
         videos: list[dict],
         page_state: dict,
         finished: bool,
+        from_cache: bool = False,
     ) -> None:
         if (
             not self.current_chat
@@ -927,9 +1120,13 @@ class MainWindow(QMainWindow):
         if videos:
             self.table.sortItems(5, Qt.DescendingOrder)
             self._rebuild_row_index()
-            self.worker.submit(
-                "load_video_thumbnails", request_id, chat_id, list(videos)
-            )
+            if from_cache:
+                for video in videos:
+                    thumb = self.paths.data_dir / "thumbnails" / str(chat_id) / f"{video['message_id']}.thumb"
+                    if thumb.is_file():
+                        self.set_video_thumbnail(request_id, chat_id, int(video["message_id"]), thumb.read_bytes(), "")
+            elif self._telegram_ready:
+                self.worker.submit("load_video_thumbnails", request_id, chat_id, list(videos))
         if finished:
             self.video_page_state = page_state
             self.reached_end = bool(page_state.get("reached_end", False))
@@ -1161,9 +1358,53 @@ class MainWindow(QMainWindow):
         if not videos:
             self.show_notice("请先勾选要下载的视频。", "warning")
             return
+        ready: list[dict] = []
+        confirmed = 0
+        uncertain = 0
+        for video in videos:
+            key = (int(video["chat_id"]), int(video["message_id"]))
+            local = self.storage.get_download(*key)
+            kind, _ = self._cloud_match(video)
+            if local and local["status"] == "completed" and Path(local["file_path"]).is_file():
+                confirmed += 1
+            elif kind == "confirmed":
+                confirmed += 1
+            else:
+                ready.append(video)
+                if kind in {"suspected", "unverified"} or video["name"].casefold() in self._existing_names:
+                    uncertain += 1
+        if uncertain:
+            answer = QMessageBox.question(
+                self, "下载前核对", f"{uncertain} 个视频的本地或云端状态尚未确认。仍要下载这些视频吗？",
+            )
+            if answer != QMessageBox.Yes:
+                ready = [
+                    video for video in ready
+                    if self._cloud_match(video)[0] == "missing"
+                    and video["name"].casefold() not in self._existing_names
+                ]
+        if not ready:
+            self.show_notice(f"所选视频已存在或尚待确认：{confirmed + uncertain} 个。可用“重新下载所选”明确覆盖历史判断。", "info")
+            return
         directory = self.directory_edit.text()
         Path(directory).mkdir(parents=True, exist_ok=True)
-        self.worker.submit("enqueue_downloads", videos, directory)
+        self.worker.submit("enqueue_downloads", ready, directory, True)
+        if confirmed:
+            self.show_notice(f"已跳过 {confirmed} 个已下载或云端已确认的视频。", "info")
+        self.show_download_manager()
+
+    def redownload_selected(self) -> None:
+        videos = self.selected_videos()
+        if not videos:
+            self.show_notice("请先勾选要重新下载的视频。", "warning")
+            return
+        if QMessageBox.question(
+            self, "重新下载", f"将重新下载 {len(videos)} 个视频，历史完成记录仍会保留。继续吗？",
+        ) != QMessageBox.Yes:
+            return
+        directory = self.directory_edit.text()
+        Path(directory).mkdir(parents=True, exist_ok=True)
+        self.worker.submit("enqueue_downloads", videos, directory, True)
         self.show_download_manager()
 
     def upload_selected(self) -> None:
@@ -1197,39 +1438,8 @@ class MainWindow(QMainWindow):
         self.show_upload_manager()
 
     def supplement_completed_downloads(self) -> None:
-        queued = 0
-        for record in self.storage.completed_downloads():
-            key = (int(record["chat_id"]), int(record["message_id"]))
-            uploaded = self.storage.get_upload(*key)
-            if uploaded and uploaded["status"] == "completed":
-                continue
-            source = Path(record["file_path"])
-            if not source.is_file():
-                continue
-            row = self._row_by_key.get(key)
-            video = (
-                dict(self.table.item(row, 0).data(Qt.UserRole))
-                if row is not None
-                else {
-                    "chat_id": key[0],
-                    "message_id": key[1],
-                    "chat_title": record.get("chat_title") or "历史下载",
-                    "name": source.name,
-                }
-            )
-            self.upload_worker.submit(
-                "enqueue_upload",
-                {
-                    **video,
-                    "file_path": str(source),
-                    "size": source.stat().st_size,
-                    "priority": 1,
-                },
-            )
-            queued += 1
-        self.show_notice(f"已加入 {queued} 个历史上传任务。", "success")
-        if queued:
-            self.show_upload_manager()
+        self.show_notice("正在核对云端清单与全部历史下载记录…", "info")
+        self.upload_worker.submit("scan_cloud_inventory")
 
     def cancel_selected(self) -> None:
         keys = [(item["chat_id"], item["message_id"]) for item in self.selected_videos()]
@@ -1352,7 +1562,7 @@ class MainWindow(QMainWindow):
         for job in jobs:
             item = dict(job["item"])
             item["priority"] = int(job.get("priority", 1))
-            self.worker.submit("enqueue_downloads", [item], job["directory"])
+            self.worker.submit("enqueue_downloads", [item], job["directory"], True)
 
     def show_download_manager(self) -> None:
         self.download_manager.show()
@@ -1369,6 +1579,12 @@ class MainWindow(QMainWindow):
         self.cloud_settings.show()
         self.cloud_settings.raise_()
         self.cloud_settings.activateWindow()
+
+    def show_cloud_library(self) -> None:
+        self.cloud_library.set_inventory(self._cloud_files, self._cloud_verified)
+        self.cloud_library.show()
+        self.cloud_library.raise_()
+        self.cloud_library.activateWindow()
 
     def save_cloud_settings(self) -> None:
         self.config.save(self.paths.config_file)
@@ -1398,16 +1614,28 @@ class MainWindow(QMainWindow):
             "failed": "上传失败",
             "cancelled": "已取消",
             "remote_missing": "云端已删除",
+            "needs_review": "疑似重复·待确认",
         }
         if row is not None:
             self.table.item(row, 8).setText(labels.get(state, state))
             self.table.item(row, 8).setToolTip(detail)
         self.upload_manager.update_state(chat_id, message_id, state, detail)
+        if state == "completed" and self.cloud_library.isVisible():
+            self.cloud_library.refresh()
 
     def _upload_label(self, key: tuple[int, int]) -> str:
         record = self.storage.get_upload(*key)
+        video = self.library.video(*key)
+        if video:
+            kind, _ = self._cloud_match(video)
+            if kind == "confirmed":
+                return "云端已确认"
+            if kind == "suspected":
+                return "云端疑似重复"
+            if kind == "unverified" and (record or self._cloud_files):
+                return "云端待核对"
         if not record:
-            return "未上传"
+            return "云端缺失" if self._cloud_verified else "云端待核对"
         return {
             "queued": "等待上传",
             "processing": "规范元数据",
@@ -1416,7 +1644,93 @@ class MainWindow(QMainWindow):
             "failed": "上传失败",
             "cancelled": "已取消",
             "remote_missing": "云端已删除",
+            "needs_review": "疑似重复·待确认",
         }.get(record["status"], record["status"])
+
+    def _cloud_match(self, video: dict) -> tuple[str, str]:
+        key = (int(video["chat_id"]), int(video["message_id"]))
+        return classify_cloud_video(
+            video, self.storage.get_upload(*key), self._cloud_files,
+            verified=self._cloud_verified,
+        )
+
+    def set_cloud_inventory(self, files: list[dict], error: str) -> None:
+        if error:
+            self._cloud_verified = False
+            self.show_notice(f"云端核对失败：{error}。历史清单仍可查看。", "warning")
+        else:
+            self._cloud_files = files
+            self._cloud_verified = True
+        for key, row in self._row_by_key.items():
+            self.table.item(row, 8).setText(self._upload_label(key))
+        self.cloud_library.set_inventory(self._cloud_files, self._cloud_verified)
+
+    def set_cloud_review(self, items: list[dict]) -> None:
+        for item in items:
+            key = (int(item["chat_id"]), int(item["message_id"]))
+            self._cloud_review[key] = item
+        if items:
+            self.show_notice(
+                f"有 {len(items)} 个云端文件疑似对应历史下载；请在“云盘清单”中逐项确认。",
+                "warning", 12000,
+            )
+
+    def show_cloud_rename_probe(self, ok: bool, message: str) -> None:
+        self._rename_probe_ok = ok
+        QMessageBox.information(self, "云端改名实测", message)
+
+    def show_cloud_rename_plan(self, plan: dict) -> None:
+        candidates = plan["candidates"]
+        skipped = plan["skipped"]
+        if not candidates:
+            QMessageBox.information(self, "旧文件改名预览", f"没有可安全改名的旧文件；跳过 {len(skipped)} 项。")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("旧云端文件改名预览")
+        dialog.resize(1000, 520)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(
+            f"可改名 {len(candidates)} 项，跳过 {len(skipped)} 项。仅勾选有准确上传记录的文件；目标已存在的文件会跳过。"
+        ))
+        table = QTableWidget(len(candidates), 3)
+        table.setHorizontalHeaderLabels(["选择", "当前云端路径", "改名后路径"])
+        table.setColumnWidth(0, 60)
+        table.setColumnWidth(1, 430)
+        table.horizontalHeader().setStretchLastSection(True)
+        for row, item in enumerate(candidates):
+            checkbox = QTableWidgetItem()
+            checkbox.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            checkbox.setCheckState(Qt.Unchecked)
+            table.setItem(row, 0, checkbox)
+            table.setItem(row, 1, QTableWidgetItem(item["old_path"]))
+            table.setItem(row, 2, QTableWidgetItem(item["new_path"]))
+        layout.addWidget(table)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("执行勾选的改名")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        selected = [
+            item for row, item in enumerate(candidates)
+            if table.item(row, 0).checkState() == Qt.Checked
+        ]
+        if not selected:
+            return
+        if not self._rename_probe_ok:
+            QMessageBox.warning(self, "尚未实测", "请先点击“实测云端改名”，确认当前挂载支持改名。")
+            return
+        self.upload_worker.submit("execute_cloud_renames", selected)
+
+    def show_cloud_rename_result(self, results: list[dict]) -> None:
+        success = sum(1 for item in results if item["ok"])
+        failed = [item for item in results if not item["ok"]]
+        detail = "\n".join(f"{item['old_path']}：{item['detail']}" for item in failed[:10])
+        QMessageBox.information(
+            self, "云端改名结果",
+            f"已核验改名 {success} 项，失败 {len(failed)} 项。" + (f"\n{detail}" if detail else ""),
+        )
 
     def _download_label(self, key: tuple[int, int]) -> str:
         record = self.storage.get_download(*key)

@@ -92,6 +92,11 @@ class Storage:
             ).fetchall()
         return {int(row["chat_id"]): dict(row) for row in rows}
 
+    def all_rules(self) -> list[dict]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM auto_rules").fetchall()
+        return [dict(row) for row in rows]
+
     def save_rule(self, chat_id: int, chat_title: str, enabled: bool, directory: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
         previous = self.get_rule(chat_id)
@@ -176,6 +181,22 @@ class Storage:
             row = connection.execute(
                 "SELECT * FROM uploads WHERE chat_id = ? AND message_id = ?",
                 (chat_id, message_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def completed_uploads(self) -> list[dict]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM uploads WHERE status='completed' AND remote_path<>'' "
+                "ORDER BY chat_id,message_id"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upload_for_remote_path(self, remote_path: str) -> dict | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM uploads WHERE remote_path=? AND status='completed'",
+                (remote_path,),
             ).fetchone()
         return dict(row) if row else None
 
@@ -334,7 +355,7 @@ class Storage:
             rows = connection.execute(
                 """
                 SELECT * FROM uploads
-                WHERE status IN ('queued', 'processing', 'uploading', 'failed', 'cancelled')
+                WHERE status IN ('queued', 'processing', 'uploading', 'failed', 'cancelled', 'remote_missing', 'needs_review')
                 ORDER BY priority, rowid
                 """
             ).fetchall()

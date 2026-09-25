@@ -17,6 +17,9 @@
 - `config.py`：非秘密设置的 JSON 读写。
 - `credentials.py`：通过 Windows keyring 保存 API Hash 和 OpenList 密码。
 - `storage.py`：SQLite 表结构与下载/上传/自动规则记录。
+- `library.py`：聊天和视频缓存、分页位置、下载任务、云端清单及改名记录。
+- `cloud_catalog.py`：根据可信上传记录、稳定标识或同名线索分级匹配云端文件。
+- `cloud_ui.py`：云端清单、疑似匹配确认和改名实测入口。
 - `telegram_service.py`：Telethon 登录、筛选分页、下载和自动监听。
 - `upload_service.py`：FFmpeg、WebDAV 队列和远端校验。
 - `compression_service.py`：H.265 压缩等级、进度、失败保护和重启恢复。
@@ -29,20 +32,21 @@
 1. 启动前检测 `127.0.0.1:7890`。
 2. Telethon 只使用 SOCKS5 代理建立连接。
 3. 历史扫描分别使用 Video、RoundVideo 与 Document 服务端筛选。
-4. 结果以聊天 ID 和消息 ID 去重后逐批发送到界面。
+4. 结果以聊天 ID 和消息 ID 去重后逐批写入 SQLite 并发送到界面；重启和切换聊天先读取缓存。
 5. 下载任务写入 `.part`，完成后原子改名并写入 SQLite。
 6. 开启自动规则后，新消息事件复用同一媒体识别与下载流程。
 
 切换群聊会取消旧扫描。FloodWait 会保留已有结果并按 Telegram 指示等待。
+打开已有缓存的聊天只查询缓存最新消息之后的媒体；历史消息编辑或删除由用户手动点击“重新核对历史”处理。
 
 ## 上传数据流
 
-1. 下载成功后按设置进入上传队列。
+1. 启动后读取已完成下载与云端清单；云盘缺失而本地仍在的文件按设置进入上传队列。新下载也按设置进入队列。
 2. FFmpeg 使用 `-c copy` 写入临时 staging 文件。
 3. WebDAV 依次执行 PROPFIND、MKCOL 和 PUT。
-4. 同名同大小会补记为已上传；同名不同大小追加消息 ID，不覆盖远端文件。
+4. 新上传文件名包含聊天 ID 和消息 ID。可信上传路径或新标识可直接确认，旧同名文件仅标为疑似；任何目标路径已存在但大小不同均暂停，绝不覆盖。
 5. PUT 完成后重新查询远端大小，一致后才记录完成并清理 staging。
-6. 程序不提供删除云端文件的操作。
+6. 程序不提供删除云端视频的操作。旧云端视频改名仅在用户预览、临时小文件实测和逐项选中后执行。
 
 ## 压缩数据流
 
@@ -58,12 +62,15 @@ OpenList、FFmpeg 工具下载和 WebDAV 客户端均设置 `trust_env=False` �
 
 用户数据根目录是 `%LOCALAPPDATA%\TelegramVideoDownloader`。
 
-SQLite 包含三张表：
+SQLite 主要包含：
 
 - `auto_rules`：群聊、启用状态、目录和启用时间。
 - `downloads`：聊天 ID、消息 ID、最终路径、大小和状态。
 - `uploads`：源路径、处理后名称、远端路径、大小、ETag、优先级和状态。
 - `compression_records`：原始路径/大小、当前路径/大小、压缩等级、节省比例、临时文件和状态。
+- `library_chats` / `library_videos` / `library_state`：上次聊天、视频元数据、分页位置和云端上次核对时间。
+- `download_tasks`：下载队列、优先级和上次状态。
+- `cloud_inventory` / `cloud_renames`：已核对的云端文件清单与旧文件改名映射。
 
 本地文件存在状态是派生信息。删除本地视频不会删除已验证的云端上传记录。
 

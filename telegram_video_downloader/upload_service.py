@@ -14,14 +14,17 @@ import xml.etree.ElementTree as ET
 import zipfile
 from collections import deque
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
+from uuid import uuid4
 
 import httpx
 from PySide6.QtCore import QObject, Signal
 
 from .config import AppConfig
+from .cloud_catalog import classify_cloud_video
+from .library import LibraryStore, cloud_name, identity_from_name
 from .naming import sanitize_component
 from .openlist_manager import OpenListManager
 from .paths import AppPaths
@@ -102,12 +105,18 @@ class UploadWorker(QObject):
     upload_metrics = Signal(object, object, object)
     upload_priority = Signal(object, object, int)
     cloud_state = Signal(object)
+    cloud_inventory_ready = Signal(object, str)
+    review_needed = Signal(object)
+    rename_plan_ready = Signal(object)
+    rename_result = Signal(object)
+    rename_probe_result = Signal(bool, str)
 
     def __init__(self, paths: AppPaths, config: AppConfig) -> None:
         super().__init__()
         self.paths = paths
         self.config = config
         self.storage = Storage(paths.database_file)
+        self.library = LibraryStore(paths.database_file)
         self.openlist = OpenListManager(paths, config)
         self.loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -120,6 +129,10 @@ class UploadWorker(QObject):
         self._active: set[tuple[int, int]] = set()
         self._cancelled: set[tuple[int, int]] = set()
         self._shutting_down = False
+        self._rename_verified = False
+        self._fresh_cloud_files: list[dict] | None = None
+        self._inventory_event: asyncio.Event | None = None
+        self._scan_lock: asyncio.Lock | None = None
 
     def start(self) -> None:
         if self.isRunning():
@@ -138,8 +151,14 @@ class UploadWorker(QObject):
         self._queue = asyncio.PriorityQueue()
         self._pause_event = asyncio.Event()
         self._pause_event.set()
+        self._inventory_event = asyncio.Event()
+        self._scan_lock = asyncio.Lock()
         self._worker_task = self.loop.create_task(self._upload_worker())
         self.loop.create_task(self._restore_jobs())
+        if self.config.cloud_enabled:
+            self.loop.create_task(self._startup_cloud_check())
+        if self._shutting_down:
+            self.loop.call_soon(self.loop.stop)
         try:
             self.loop.run_forever()
         finally:
@@ -207,8 +226,21 @@ class UploadWorker(QObject):
         key = (int(payload["chat_id"]), int(payload["message_id"]))
         previous = self.storage.get_upload(*key)
         if previous and previous["status"] == "completed":
-            self.upload_state.emit(*key, "completed", previous["remote_path"])
-            return
+            if self._fresh_cloud_files is None:
+                self.upload_state.emit(*key, "needs_review", "请先核对云端清单")
+                return
+            kind, found_path = classify_cloud_video(
+                payload, previous, self._fresh_cloud_files, verified=True,
+            )
+            if kind == "confirmed":
+                self.upload_state.emit(*key, "completed", found_path)
+                return
+            if kind == "suspected" and not payload.get("cloud_override"):
+                self.storage.update_upload(*key, "needs_review", "云端存在疑似同名文件")
+                self.review_needed.emit([{**payload, "remote_path": found_path}])
+                self.upload_state.emit(*key, "needs_review", found_path)
+                return
+            self.storage.update_upload(*key, "remote_missing", "云端文件已不存在")
         if key in self._jobs:
             return
         job = dict(payload)
@@ -395,7 +427,7 @@ class UploadWorker(QObject):
             sanitize_component(str(job.get("chat_title") or "未命名")),
             f"{now.year:04d}",
             f"{now.month:02d}",
-            processed.name,
+            cloud_name(processed.name, int(job["chat_id"]), int(job["message_id"])),
         ]
 
     def _webdav_url(self, parts: list[str]) -> str:
@@ -452,8 +484,30 @@ class UploadWorker(QObject):
         key = (int(job["chat_id"]), int(job["message_id"]))
         assert self._pause_event is not None
         await self._pause_event.wait()
+        if self.config.cloud_enabled:
+            assert self._inventory_event is not None
+            await self._inventory_event.wait()
+        if self._fresh_cloud_files is None:
+            raise RuntimeError("云端清单尚未核实，上传已暂停；请在云盘管理中重新核对。")
         if not self.openlist.running():
             raise RuntimeError("OpenList 未运行，请先在云盘设置中启动。")
+        if self._fresh_cloud_files is not None:
+            kind, found_path = classify_cloud_video(
+                job, self.storage.get_upload(*key), self._fresh_cloud_files, verified=True,
+            )
+            if kind == "confirmed":
+                remote = next(f for f in self._fresh_cloud_files if f["remote_path"] == found_path)
+                self.storage.update_upload(
+                    *key, "completed", "云端已有，已核实", PurePosixPath(found_path).name,
+                    found_path, int(remote["size"]), str(remote.get("etag", "")),
+                )
+                self.upload_state.emit(*key, "completed", found_path)
+                return
+            if kind == "suspected" and not job.get("cloud_override"):
+                self.storage.update_upload(*key, "needs_review", "云端存在疑似同名文件")
+                self.review_needed.emit([{**job, "remote_path": found_path}])
+                self.upload_state.emit(*key, "needs_review", found_path)
+                return
         processed = await self._standardize(job)
         parts = self._remote_parts(job, processed)
         password = self.openlist.password()
@@ -492,24 +546,20 @@ class UploadWorker(QObject):
                         *key,
                         "completed",
                         "云端同名同大小，已完成校验",
-                        processed.name,
+                        parts[-1],
                         remote_path,
                         processed_size,
                         existing["etag"],
                     )
                     self.upload_progress.emit(*key, 100)
                     self.upload_state.emit(*key, "completed", remote_path)
+                    self._remember_uploaded_file(remote_path, processed_size, existing["etag"])
                     return
                 if existing:
-                    renamed = processed.with_name(
-                        f"{processed.stem}_tg_{key[1]}{processed.suffix}"
-                    )
-                    processed.replace(renamed)
-                    processed = renamed
-                    parts[-1] = processed.name
+                    raise RuntimeError("云端同一视频标识的文件大小不同，已暂停以避免覆盖。")
                 remote_path = "/" + "/".join(parts)
                 self.storage.update_upload(
-                    *key, "uploading", remote_path, processed.name, remote_path
+                    *key, "uploading", remote_path, parts[-1], remote_path
                 )
                 self.upload_state.emit(*key, "uploading", remote_path)
                 rate_tracker = UploadRateTracker()
@@ -539,7 +589,7 @@ class UploadWorker(QObject):
                     *key,
                     "completed",
                     "上传并校验完成",
-                    processed.name,
+                    parts[-1],
                     remote_path,
                     size,
                     verified["etag"],
@@ -549,10 +599,20 @@ class UploadWorker(QObject):
                     *key, {"current": size, "total": size, "speed": 0.0, "eta": 0.0}
                 )
                 self.upload_state.emit(*key, "completed", remote_path)
+                self._remember_uploaded_file(remote_path, size, verified["etag"])
         finally:
             processed.unlink(missing_ok=True)
             with contextlib.suppress(OSError):
                 processed.parent.rmdir()
+
+    def _remember_uploaded_file(self, remote_path: str, size: int, etag: str) -> None:
+        if self._fresh_cloud_files is None:
+            return
+        self._fresh_cloud_files = [
+            file for file in self._fresh_cloud_files if file["remote_path"] != remote_path
+        ] + [{"remote_path": remote_path, "size": size, "etag": etag}]
+        self.library.replace_cloud_inventory(self._fresh_cloud_files)
+        self.cloud_inventory_ready.emit(self._fresh_cloud_files, "")
 
     async def install_openlist(self) -> None:
         self.status.emit("正在下载并校验 OpenList…")
@@ -627,6 +687,8 @@ class UploadWorker(QObject):
         await asyncio.to_thread(self.openlist.start)
         self.cloud_state.emit(self.openlist.state())
         self.status.emit("OpenList 已启动。")
+        if self.config.cloud_enabled:
+            await self.scan_cloud_inventory()
 
     async def set_openlist_password(self, password: str) -> None:
         await asyncio.to_thread(self.openlist.set_password, password)
@@ -643,6 +705,310 @@ class UploadWorker(QObject):
         ffmpeg = self.ffmpeg_path()
         state["ffmpeg_path"] = str(ffmpeg) if ffmpeg else ""
         self.cloud_state.emit(state)
+
+    async def _startup_cloud_check(self) -> None:
+        await asyncio.sleep(1)
+        try:
+            await asyncio.to_thread(self.openlist.start)
+            await self.refresh_cloud_state()
+            await self.scan_cloud_inventory()
+        except Exception as exc:
+            LOGGER.warning("Cloud startup check postponed: %s", exc)
+            self.status.emit(f"云盘暂时不可用，已保留本地记录：{exc}")
+            if self._inventory_event is not None:
+                self._inventory_event.set()
+            self.cloud_inventory_ready.emit([], str(exc))
+
+    async def _list_directory(self, client: httpx.AsyncClient, parts: list[str]) -> list[dict]:
+        response = await client.request(
+            "PROPFIND", self._webdav_url(parts), headers={"Depth": "1"}
+        )
+        if response.status_code not in {200, 207}:
+            raise RuntimeError(f"列出云端目录失败：HTTP {response.status_code}")
+        try:
+            root = ET.fromstring(response.content)
+        except ET.ParseError as exc:
+            raise RuntimeError("云端目录返回了无效的 WebDAV 响应") from exc
+        current = "/" + "/".join(parts)
+        entries: list[dict] = []
+        for node in root.findall("{DAV:}response"):
+            href = node.findtext("{DAV:}href") or ""
+            raw_path = unquote(urlsplit(href).path).rstrip("/")
+            if not raw_path.startswith("/dav/"):
+                continue
+            remote_path = raw_path[4:]
+            if remote_path == current:
+                continue
+            kind = node.find(".//{DAV:}resourcetype/{DAV:}collection")
+            size_text = node.findtext(".//{DAV:}getcontentlength") or "0"
+            etag = (node.findtext(".//{DAV:}getetag") or "").strip('"')
+            entries.append({
+                "remote_path": remote_path,
+                "is_dir": kind is not None,
+                "size": int(size_text) if size_text.isdecimal() else 0,
+                "etag": etag,
+            })
+        return entries
+
+    async def scan_cloud_inventory(self) -> None:
+        if self._scan_lock is None:
+            self._scan_lock = asyncio.Lock()
+        async with self._scan_lock:
+            try:
+                await self._scan_cloud_inventory_unlocked()
+            except Exception as exc:
+                self._fresh_cloud_files = None
+                if self._inventory_event is not None:
+                    self._inventory_event.set()
+                self.cloud_inventory_ready.emit([], str(exc))
+                raise
+
+    async def _scan_cloud_inventory_unlocked(self) -> None:
+        """Replace the index only after the entire app-owned tree was read."""
+        if not self.openlist.running():
+            raise RuntimeError("OpenList 未运行，云端状态尚未核实。")
+        root = [
+            self.config.openlist_mount.strip("/"),
+            sanitize_component(self.config.cloud_root),
+        ]
+        files: list[dict] = []
+        async with httpx.AsyncClient(
+            auth=("admin", self.openlist.password()), timeout=30, trust_env=False
+        ) as client:
+            if await self._propfind(client, root[:1]) is None:
+                raise RuntimeError("阿里云盘挂载不可用。")
+            if await self._propfind(client, root) is not None:
+                pending = [root]
+                while pending:
+                    parts = pending.pop()
+                    for entry in await self._list_directory(client, parts):
+                        if entry["is_dir"]:
+                            pending.append(list(PurePosixPath(entry["remote_path"]).parts[1:]))
+                        else:
+                            files.append({key: entry[key] for key in ("remote_path", "size", "etag")})
+        self.library.replace_cloud_inventory(files)
+        self._fresh_cloud_files = files
+        if self._inventory_event is not None:
+            self._inventory_event.set()
+        self.cloud_inventory_ready.emit(files, "")
+        self.status.emit(f"云盘清单已核对：{len(files)} 个文件。")
+        await self.reconcile_local_downloads()
+
+    async def reconcile_local_downloads(self) -> None:
+        """Queue missing backups without relying on the visible history page."""
+        if self._fresh_cloud_files is None:
+            return
+        review: list[dict] = []
+        queued = 0
+        for row in self.storage.completed_downloads():
+            key = (int(row["chat_id"]), int(row["message_id"]))
+            source = Path(row["file_path"])
+            if not source.is_file():
+                continue
+            upload = self.storage.get_upload(*key)
+            cached = self.library.video(*key)
+            title = self.library.chat_title(key[0]) or (upload or {}).get("chat_title", "")
+            if not title:
+                continue
+            video = dict(cached or {})
+            video.update({
+                "chat_id": key[0], "message_id": key[1], "chat_title": title,
+                "name": source.name, "size": source.stat().st_size,
+                "file_path": str(source), "priority": 1,
+            })
+            kind, remote_path = classify_cloud_video(
+                video, upload, self._fresh_cloud_files, verified=True,
+            )
+            if kind == "confirmed":
+                remote = next(f for f in self._fresh_cloud_files if f["remote_path"] == remote_path)
+                if not upload:
+                    self.storage.save_upload_job(*key, title, str(source), source.stat().st_size)
+                self.storage.update_upload(
+                    *key, "completed", "云端文件已核实", PurePosixPath(remote_path).name,
+                    remote_path, int(remote["size"]), str(remote.get("etag", "")),
+                )
+            elif kind == "suspected":
+                review.append({**video, "remote_path": remote_path})
+            elif kind == "missing" and self.config.cloud_auto_upload:
+                if upload and upload["status"] == "completed":
+                    self.storage.update_upload(*key, "remote_missing", "云端文件已不存在")
+                await self.enqueue_upload(video)
+                queued += 1
+        self.review_needed.emit(review)
+        if queued:
+            self.status.emit(f"已自动补入 {queued} 个云端缺失的视频。")
+
+    async def confirm_cloud_match(self, item: dict) -> None:
+        """Adopt a legacy file only after the user accepts a specific pair."""
+        if self._fresh_cloud_files is None:
+            raise RuntimeError("云端清单尚未核实。")
+        key = (int(item["chat_id"]), int(item["message_id"]))
+        path = str(item["remote_path"])
+        remote = next((f for f in self._fresh_cloud_files if f["remote_path"] == path), None)
+        if remote is None:
+            raise RuntimeError("选中的云端文件已不在最新清单中。")
+        other = self.storage.upload_for_remote_path(path)
+        if other and (int(other["chat_id"]), int(other["message_id"])) != key:
+            raise RuntimeError("该云端文件已经对应另一个视频。")
+        previous = self.storage.get_upload(*key)
+        if identity_from_name(PurePosixPath(path).name) == key and previous and (
+            int(previous.get("remote_size") or 0) != int(remote["size"])
+        ):
+            raise RuntimeError("同标识文件的上传大小尚未核实，不能人工确认为完整副本。")
+        source = Path(str(item["file_path"]))
+        self.storage.save_upload_job(
+            *key, str(item["chat_title"]), str(source),
+            source.stat().st_size if source.is_file() else 0,
+        )
+        self.storage.update_upload(
+            *key, "completed", "用户确认云端旧文件", PurePosixPath(path).name,
+            path, int(remote["size"]), str(remote.get("etag", "")),
+        )
+        self.upload_state.emit(*key, "completed", path)
+
+    async def plan_cloud_renames(self) -> None:
+        if self._fresh_cloud_files is None:
+            raise RuntimeError("请先核对云端清单。")
+        by_path = {f["remote_path"]: f for f in self._fresh_cloud_files}
+        candidates: list[dict] = []
+        skipped: list[dict] = []
+        for record in self.storage.completed_uploads():
+            key = (int(record["chat_id"]), int(record["message_id"]))
+            old_path = str(record["remote_path"])
+            remote = by_path.get(old_path)
+            if remote is None or not int(record["remote_size"] or 0) or (
+                int(remote["size"]) != int(record["remote_size"])
+            ):
+                skipped.append({"old_path": old_path, "reason": "源文件不存在或大小不符"})
+                continue
+            current_name = PurePosixPath(old_path).name
+            new_name = cloud_name(current_name, *key)
+            new_path = str(PurePosixPath(old_path).with_name(new_name))
+            if new_path == old_path:
+                continue
+            if new_path in by_path:
+                skipped.append({"old_path": old_path, "reason": "目标名称已存在"})
+                continue
+            candidates.append({
+                "chat_id": key[0], "message_id": key[1],
+                "old_path": old_path, "new_path": new_path,
+                "size": int(remote["size"]),
+            })
+        self.rename_plan_ready.emit({"candidates": candidates, "skipped": skipped})
+
+    async def _move_remote(self, client: httpx.AsyncClient, source: str, target: str) -> None:
+        source_parts = list(PurePosixPath(source).parts[1:])
+        target_parts = list(PurePosixPath(target).parts[1:])
+        response = await client.request(
+            "MOVE", self._webdav_url(source_parts),
+            headers={"Destination": self._webdav_url(target_parts), "Overwrite": "F"},
+        )
+        if response.status_code not in {201, 204}:
+            raise RuntimeError(f"云端改名失败：HTTP {response.status_code}")
+
+    async def probe_cloud_rename(self) -> None:
+        if self._scan_lock is None:
+            self._scan_lock = asyncio.Lock()
+        async with self._scan_lock:
+            await self._probe_cloud_rename_unlocked()
+
+    async def _probe_cloud_rename_unlocked(self) -> None:
+        """Prove this mounted drive can rename before enabling legacy migration."""
+        self._rename_verified = False
+        root = [self.config.openlist_mount.strip("/"), sanitize_component(self.config.cloud_root)]
+        token = uuid4().hex
+        old_parts = [*root, f".__tvd_probe_{token}.txt"]
+        new_parts = [*root, f".__tvd_probe_{token}_renamed.txt"]
+        old_path = "/" + "/".join(old_parts)
+        new_path = "/" + "/".join(new_parts)
+        cleanup_error = ""
+        try:
+            if not self.openlist.running():
+                raise RuntimeError("OpenList 未运行。")
+            async with httpx.AsyncClient(
+                auth=("admin", self.openlist.password()), timeout=30, trust_env=False,
+            ) as client:
+                await self._ensure_directories(client, root)
+                response = await client.put(self._webdav_url(old_parts), content=b"rename-probe")
+                if response.status_code not in {200, 201, 204}:
+                    raise RuntimeError(f"创建临时测试文件失败：HTTP {response.status_code}")
+                try:
+                    await self._move_remote(client, old_path, new_path)
+                    new_info = await self._propfind(client, new_parts)
+                    old_info = await self._propfind(client, old_parts)
+                    if not new_info or int(new_info["size"]) != len(b"rename-probe") or old_info:
+                        raise RuntimeError("改名后新旧路径核验失败。")
+                    self._rename_verified = True
+                finally:
+                    for parts in (new_parts, old_parts):
+                        try:
+                            if await self._propfind(client, parts) is not None:
+                                result = await client.delete(self._webdav_url(parts))
+                                if result.status_code not in {200, 204, 404}:
+                                    cleanup_error = f"临时文件清理失败：HTTP {result.status_code}"
+                        except Exception as exc:
+                            cleanup_error = f"临时文件清理失败：{exc}"
+            message = "当前云盘挂载的小文件改名已实测通过。"
+            if cleanup_error:
+                self._rename_verified = False
+                message = cleanup_error
+            self.rename_probe_result.emit(self._rename_verified, message)
+        except Exception as exc:
+            self._rename_verified = False
+            self.rename_probe_result.emit(False, f"改名实测未通过：{exc}")
+
+    async def execute_cloud_renames(self, items: list[dict]) -> None:
+        if self._scan_lock is None:
+            self._scan_lock = asyncio.Lock()
+        async with self._scan_lock:
+            await self._execute_cloud_renames_unlocked(items)
+
+    async def _execute_cloud_renames_unlocked(self, items: list[dict]) -> None:
+        if not self._rename_verified:
+            raise RuntimeError("请先用临时小文件实测当前云盘挂载的改名能力。")
+        if self._fresh_cloud_files is None:
+            raise RuntimeError("云端清单尚未核实。")
+        results: list[dict] = []
+        by_path = {f["remote_path"]: f for f in self._fresh_cloud_files}
+        async with httpx.AsyncClient(
+            auth=("admin", self.openlist.password()), timeout=60, trust_env=False,
+        ) as client:
+            for item in items:
+                key = (int(item["chat_id"]), int(item["message_id"]))
+                old_path = str(item["old_path"])
+                new_path = str(item["new_path"])
+                record = self.storage.get_upload(*key)
+                try:
+                    if not record or record["status"] != "completed" or record["remote_path"] != old_path:
+                        raise RuntimeError("上传记录已变化")
+                    if int(record["remote_size"]) != int(item["size"]):
+                        raise RuntimeError("上传记录与云端大小不符")
+                    if new_path != str(PurePosixPath(old_path).with_name(
+                        cloud_name(PurePosixPath(old_path).name, *key)
+                    )):
+                        raise RuntimeError("目标名称与视频标识不一致")
+                    if new_path in by_path:
+                        raise RuntimeError("目标文件已存在")
+                    old_parts = list(PurePosixPath(old_path).parts[1:])
+                    new_parts = list(PurePosixPath(new_path).parts[1:])
+                    old_info = await self._propfind(client, old_parts)
+                    if not old_info or int(old_info["size"]) != int(item["size"]):
+                        raise RuntimeError("源文件不存在或大小变化")
+                    if await self._propfind(client, new_parts) is not None:
+                        raise RuntimeError("目标名称已存在")
+                    await self._move_remote(client, old_path, new_path)
+                    new_info = await self._propfind(client, new_parts)
+                    old_after = await self._propfind(client, old_parts)
+                    if not new_info or int(new_info["size"]) != int(item["size"]) or old_after:
+                        raise RuntimeError("改名后核验失败，请检查两个路径")
+                    self.library.record_cloud_rename(*key, old_path, new_path)
+                    by_path[new_path] = {**by_path.pop(old_path), "remote_path": new_path}
+                    results.append({**item, "ok": True, "detail": "已核验"})
+                except Exception as exc:
+                    results.append({**item, "ok": False, "detail": str(exc)})
+        self._fresh_cloud_files = list(by_path.values())
+        self.cloud_inventory_ready.emit(self._fresh_cloud_files, "")
+        self.rename_result.emit(results)
 
     async def test_mount(self) -> None:
         if not self.openlist.running():
@@ -662,6 +1028,7 @@ class UploadWorker(QObject):
         state["mount_ready"] = True
         self.cloud_state.emit(state)
         self.status.emit("阿里云盘挂载测试成功，自动上传已启用。")
+        await self.scan_cloud_inventory()
 
     async def verify_uploads(self, keys: list[tuple[int, int]]) -> None:
         if not self.openlist.running():
@@ -710,7 +1077,7 @@ class UploadWorker(QObject):
             return True
         self._shutting_down = True
         self.openlist.stop()
-        if self.loop and self.loop.is_running():
+        if self.loop:
             self.loop.call_soon_threadsafe(self.loop.stop)
         if self._thread:
             self._thread.join(timeout_ms / 1000)

@@ -8,7 +8,7 @@
 
 - `config.json`：API ID、手机号、代理和云盘普通设置
 - `telegram.session`：Telegram 登录会话
-- `state.sqlite3`：下载、上传和自动规则记录
+- `state.sqlite3`：视频列表缓存、分页位置、下载与上传任务、云端文件清单和自动规则记录
 - `app.log`：运行与错误日志
 - `tools\openlist\data`：OpenList 配置、数据库和阿里云盘授权数据
 - `upload_staging`：上传前的临时处理文件
@@ -28,4 +28,4 @@ API Hash 与 OpenList 管理员密码由 Windows 凭据管理器保存。视频�
 - OpenList 管理页与 WebDAV：仅访问 `127.0.0.1`。
 - 阿里云盘上传：由本地 OpenList 直接连接，不使用 Telegram 代理。
 
-程序不会发送、转发或删除 Telegram 消息，也不会主动删除本地或云端视频。
+程序不会发送、转发或删除 Telegram 消息，也不提供删除云端视频的操作。网盘补传不会删除本地视频；用户手动或主动开启自动 H.265 压缩时，经校验后会用压缩文件替换本地原片。

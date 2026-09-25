@@ -23,6 +23,7 @@ from telethon.tl.types import (
 )
 
 from .config import AppConfig
+from .library import LibraryStore
 from .credentials import save_api_hash
 from .models import ChatInfo, VideoInfo
 from .naming import choose_video_name, extension_for, sanitize_component, unique_target
@@ -42,6 +43,8 @@ class TelegramWorker(QObject):
     # Telegram peer IDs are 64-bit values (for example -1002985557858).
     # Qt's Signal(int) is a signed 32-bit C++ int and silently truncates them.
     videos_ready = Signal(int, object, object, object, bool)
+    new_videos_ready = Signal(int, object, object, str)
+    history_rechecked = Signal(int, object, object, object, str)
     video_scan_status = Signal(int, object, str)
     download_progress = Signal(object, object, int)
     download_metrics = Signal(object, object, object)
@@ -58,6 +61,7 @@ class TelegramWorker(QObject):
         self.paths = paths
         self.config = config
         self.storage = Storage(paths.database_file)
+        self.library = LibraryStore(paths.database_file)
         self.loop: asyncio.AbstractEventLoop | None = None
         self.client: TelegramClient | None = None
         self._api_hash = ""
@@ -198,6 +202,7 @@ class TelegramWorker(QObject):
         self.auth_state.emit("authorized", display or getattr(me, "username", "已登录"))
         self.status.emit("Telegram 登录成功。")
         await self.load_chats()
+        await self._restore_download_jobs()
 
     async def load_chats(self) -> None:
         self._require_authorized()
@@ -216,6 +221,102 @@ class TelegramWorker(QObject):
         chats.sort(key=lambda item: item["title"].casefold())
         LOGGER.info("Loaded %d chats and cached their input entities", len(chats))
         self.chats_ready.emit(chats)
+
+    async def _restore_download_jobs(self) -> None:
+        """An interrupted transfer restarts at zero; its queue position survives."""
+        for row in self.library.download_tasks(pending_only=True):
+            item = dict(row["item"], priority=int(row["priority"]))
+            await self.enqueue_downloads(
+                [item], row["directory"], force=True, restored=True,
+            )
+
+    async def refresh_new_videos(self, request_id: int, chat_id: int, newest_id: int) -> None:
+        """Query only messages newer than the persisted catalogue head."""
+        try:
+            self._require_authorized()
+            entity = self._chat_entities.get(chat_id)
+            if entity is None:
+                entity = await self.client.get_input_entity(chat_id)
+                self._chat_entities[chat_id] = entity
+            title = self._chat_titles.get(chat_id, "未命名")
+            found: dict[int, dict] = {}
+            for filter_type in (
+                InputMessagesFilterVideo,
+                InputMessagesFilterRoundVideo,
+                InputMessagesFilterDocument,
+            ):
+                offset = 0
+                while True:
+                    batch = await self._fetch_filtered_batch(
+                        request_id, chat_id, entity, filter_type, offset, 100,
+                        min_id=newest_id,
+                    )
+                    for message in batch:
+                        info = self._video_info(message, chat_id, title)
+                        if info:
+                            found[int(message.id)] = info.to_dict()
+                            self._thumbnail_messages[(chat_id, int(message.id))] = message
+                    if len(batch) < 100:
+                        break
+                    offset = int(batch[-1].id)
+            videos = sorted(found.values(), key=lambda item: item["message_id"], reverse=True)
+            self.library.save_videos(videos)
+            self.library.save_scan_state(chat_id, self.library.scan_state(chat_id), checked=True)
+            self.new_videos_ready.emit(request_id, chat_id, videos, "")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            LOGGER.exception("Incremental video refresh failed for chat %s", chat_id)
+            self.new_videos_ready.emit(request_id, chat_id, [], str(exc))
+
+    async def recheck_history(self, request_id: int, chat_id: int) -> None:
+        """Rebuild one chat's catalogue without hiding the old one mid-scan."""
+        try:
+            self._require_authorized()
+            entity = self._chat_entities.get(chat_id)
+            if entity is None:
+                entity = await self.client.get_input_entity(chat_id)
+                self._chat_entities[chat_id] = entity
+            title = self._chat_titles.get(chat_id, "未命名")
+            found: dict[int, dict] = {}
+            cursors: dict[str, int] = {}
+            for key, filter_type in (
+                ("video", InputMessagesFilterVideo),
+                ("round", InputMessagesFilterRoundVideo),
+                ("document", InputMessagesFilterDocument),
+            ):
+                offset = 0
+                while True:
+                    batch = await self._fetch_filtered_batch(
+                        request_id, chat_id, entity, filter_type, offset, 100,
+                    )
+                    for message in batch:
+                        info = self._video_info(message, chat_id, title)
+                        if info:
+                            found[int(message.id)] = info.to_dict()
+                            self._thumbnail_messages[(chat_id, int(message.id))] = message
+                    self.video_scan_status.emit(
+                        request_id, chat_id, f"正在核对历史：已找到 {len(found)} 个视频…",
+                    )
+                    if len(batch) < 100:
+                        break
+                    offset = int(batch[-1].id)
+                cursors[key] = int(batch[-1].id) if batch else offset
+            videos = sorted(found.values(), key=lambda item: item["message_id"], reverse=True)
+            state = {
+                "cursors": cursors,
+                "exhausted": {"video": True, "round": True, "document": True},
+                "pending": [],
+                "seen_ids": sorted(found),
+                "reached_end": True,
+            }
+            self.library.replace_chat_videos(chat_id, videos, state)
+            self.history_rechecked.emit(request_id, chat_id, videos, state, "")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            LOGGER.exception("History recheck failed for chat %s", chat_id)
+            self.history_rechecked.emit(request_id, chat_id, [], {}, str(exc))
 
     async def start_video_scan(
         self,
@@ -305,6 +406,7 @@ class TelegramWorker(QObject):
         if pending:
             chunk, pending = pending[:page_size], pending[page_size:]
             emitted += len(chunk)
+            self.library.save_videos(chunk)
             self.videos_ready.emit(request_id, chat_id, chunk, {}, False)
 
         for key, filter_type in filter_specs:
@@ -358,6 +460,7 @@ class TelegramWorker(QObject):
             pending.extend(candidates[available:])
             if chunk:
                 emitted += len(chunk)
+                self.library.save_videos(chunk)
                 self.videos_ready.emit(request_id, chat_id, chunk, {}, False)
             self.video_scan_status.emit(
                 request_id,
@@ -374,6 +477,7 @@ class TelegramWorker(QObject):
             "seen_ids": sorted(seen_ids),
             "reached_end": reached_end,
         }
+        self.library.save_scan_state(chat_id, state)
         self.videos_ready.emit(request_id, chat_id, [], state, True)
         if emitted:
             message = f"扫描完成：本页显示 {emitted} 个视频，共检查 {scanned} 条媒体。"
@@ -401,19 +505,20 @@ class TelegramWorker(QObject):
         filter_type: type,
         offset_id: int,
         limit: int,
+        min_id: int = 0,
     ) -> list[Any]:
         while True:
             old_threshold = getattr(self.client, "flood_sleep_threshold", 60)
             try:
                 self.client.flood_sleep_threshold = 0
                 async def collect() -> list[Any]:
+                    options = {"limit": limit, "offset_id": offset_id, "filter": filter_type()}
+                    if min_id:
+                        options["min_id"] = min_id
                     return [
                         message
                         async for message in self.client.iter_messages(
-                            entity,
-                            limit=limit,
-                            offset_id=offset_id,
-                            filter=filter_type(),
+                            entity, **options,
                         )
                     ]
 
@@ -532,19 +637,24 @@ class TelegramWorker(QObject):
         temporary.write_bytes(data)
         temporary.replace(cache_file)
 
-    async def enqueue_downloads(self, items: list[dict], directory: str) -> None:
+    async def enqueue_downloads(
+        self, items: list[dict], directory: str, force: bool = False,
+        restored: bool = False,
+    ) -> None:
         if not self._queue:
             return
         for item in items:
             key = (int(item["chat_id"]), int(item["message_id"]))
             if key in self._queued:
                 continue
-            priority = max(0, min(2, int(item.get("priority", 1))))
-            job = {"item": dict(item), "directory": directory, "priority": priority}
-            self.download_job.emit(dict(job))
-            if self.storage.is_downloaded(*key):
+            if self.storage.is_downloaded(*key) and not force:
                 self.download_state.emit(*key, "completed", "此前已下载")
                 continue
+            priority = max(0, min(2, int(item.get("priority", 1))))
+            job = {"item": dict(item), "directory": directory, "priority": priority}
+            if not restored:
+                self.download_job.emit(dict(job))
+            self.library.save_download_task(item, directory, priority)
             self._queued.add(key)
             self._queued_jobs[key] = job
             self._queue_versions[key] = self._queue_versions.get(key, 0) + 1
@@ -574,6 +684,7 @@ class TelegramWorker(QObject):
             if not job or key in self._active_downloads:
                 continue
             job["priority"] = priority
+            self.library.set_download_priority(*key, priority)
             self._queue_versions[key] = self._queue_versions.get(key, 0) + 1
             await self._put_download_job(key)
             self.download_priority.emit(*key, priority)
@@ -677,19 +788,25 @@ class TelegramWorker(QObject):
                 continue
             item = job["item"]
             self._active_downloads.add(key)
+            self.library.update_download_task(*key, "downloading")
             try:
                 if key in self._cancelled:
+                    self.library.update_download_task(*key, "cancelled", "已取消")
                     self.download_state.emit(*key, "cancelled", "已取消")
                     continue
                 await self._download_one(item, Path(job["directory"]))
+                self.library.update_download_task(*key, "completed", "已完成")
             except asyncio.CancelledError:
                 if self._shutting_down:
                     raise
+                self.library.update_download_task(*key, "cancelled", "已取消")
                 self.download_state.emit(*key, "cancelled", "已取消")
             except Exception as exc:
                 LOGGER.exception("Download failed for %s", key)
                 self._disable_acceleration_after_error(exc)
-                self.storage.record_download(*key, "", 0, "failed")
+                if not self.storage.is_downloaded(*key):
+                    self.storage.record_download(*key, "", 0, "failed")
+                self.library.update_download_task(*key, "failed", str(exc))
                 self.download_state.emit(*key, "failed", str(exc))
             finally:
                 if self._queue_versions.get(key) == version:
@@ -794,6 +911,7 @@ class TelegramWorker(QObject):
                 self._queue_versions[key] = self._queue_versions.get(key, 0) + 1
                 self._queued_jobs.pop(key, None)
                 self._queued.discard(key)
+                self.library.update_download_task(*key, "cancelled", "已取消")
                 self.download_state.emit(*key, "cancelled", "已取消")
 
     async def save_auto_rule(
@@ -812,6 +930,7 @@ class TelegramWorker(QObject):
             return
         info = self._video_info(event.message, chat_id, rule["chat_title"])
         if info:
+            self.library.save_videos([info.to_dict()])
             await self.enqueue_downloads([info.to_dict()], rule["directory"])
 
     async def logout(self) -> None:
