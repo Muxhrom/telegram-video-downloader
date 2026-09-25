@@ -98,6 +98,35 @@ QLabel#summaryLabel {
     padding: 8px 12px;
     font-weight: 600;
 }
+QWidget#chatSidebar {
+    background: #f9fcfc;
+    border: 1px solid #d9e8e9;
+    border-radius: 11px;
+}
+QLabel#chatSidebarHeading {
+    color: #173b43;
+    font-size: 20px;
+    font-weight: 700;
+}
+QLabel#chatCountLabel {
+    color: #72868b;
+    font-size: 12px;
+}
+QLineEdit#chatSearch {
+    min-height: 28px;
+    padding: 7px 10px;
+    border-radius: 9px;
+}
+QListWidget#chatList {
+    background: transparent;
+    border: 0;
+    padding: 0;
+    outline: 0;
+}
+QSplitter::handle {
+    background: #e0eaeb;
+    width: 5px;
+}
 QCheckBox {
     spacing: 7px;
 }

@@ -5,8 +5,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QDate, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QDesktopServices, QIcon, QPixmap
+from PySide6.QtCore import QDate, QRect, QSize, QTimer, Qt, QUrl, Signal
+from PySide6.QtGui import QAction, QBrush, QColor, QDesktopServices, QFont, QFontMetrics, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSpinBox,
     QSplitter,
+    QStyledItemDelegate,
     QStyle,
     QSystemTrayIcon,
     QTableWidget,
@@ -71,6 +72,53 @@ def human_duration(seconds: float) -> str:
         return f"{minutes}分{seconds:02d}秒"
     hours, minutes = divmod(minutes, 60)
     return f"{hours}小时{minutes:02d}分"
+
+
+class ChatRowDelegate(QStyledItemDelegate):
+    """Paint chat names on as many lines as the current sidebar needs."""
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        painter.save()
+        bounds = option.rect.adjusted(5, 3, -5, -3)
+        selected = bool(option.state & QStyle.State_Selected)
+        hovered = bool(option.state & QStyle.State_MouseOver)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#d9f3f2" if selected else "#edf4f5" if hovered else "#ffffff"))
+        painter.drawRoundedRect(bounds, 9, 9)
+        if selected:
+            painter.setBrush(QColor("#118c8e"))
+            painter.drawRoundedRect(QRect(bounds.left(), bounds.top() + 8, 4, bounds.height() - 16), 2, 2)
+        title = str(index.data(Qt.UserRole + 1) or "")
+        kind = str(index.data(Qt.UserRole + 2) or "")
+        title_font = QFont(option.font)
+        title_font.setWeight(QFont.DemiBold)
+        painter.setFont(title_font)
+        painter.setPen(QColor("#0f4546" if selected else "#1b3038"))
+        text_rect = bounds.adjusted(16, 10, -13, -28)
+        painter.drawText(text_rect, Qt.TextWordWrap | Qt.AlignTop, title)
+        painter.setFont(option.font)
+        painter.setPen(QColor("#42757b" if selected else "#73858c"))
+        painter.drawText(bounds.adjusted(16, 0, -13, -10), Qt.AlignBottom, kind)
+        painter.restore()
+
+
+class ChatListWidget(QListWidget):
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.resize_rows()
+
+    def resize_rows(self) -> None:
+        width = max(120, self.viewport().width() - 48)
+        font = QFont(self.font())
+        font.setWeight(QFont.DemiBold)
+        metrics = QFontMetrics(font)
+        for index in range(self.count()):
+            item = self.item(index)
+            title = str(item.data(Qt.UserRole + 1) or "")
+            title_height = metrics.boundingRect(
+                QRect(0, 0, width, 10000), Qt.TextWordWrap, title
+            ).height()
+            item.setSizeHint(QSize(0, max(66, title_height + 42)))
 
 
 class LoginDialog(QDialog):
@@ -117,7 +165,6 @@ class DownloadManagerDialog(QDialog):
     retry_requested = Signal(object)
     priority_requested = Signal(object, int)
     pause_requested = Signal()
-    acceleration_requested = Signal(bool)
     notice = Signal(str, str)
     compression_requested = Signal(object, str)
     compression_pause_requested = Signal()
@@ -146,19 +193,6 @@ class DownloadManagerDialog(QDialog):
         self.summary_label = QLabel("暂无下载任务")
         self.summary_label.setObjectName("summaryLabel")
         layout.addWidget(self.summary_label)
-
-        acceleration_row = QHBoxLayout()
-        self.acceleration_checkbox = QCheckBox("安全加速（最多 3 个文件并行）")
-        self.acceleration_checkbox.setToolTip(
-            "仅提高多个排队视频的总下载速度，不会并行切割单个视频；"
-            "遇到 Telegram 限流或网络异常时会自动关闭。"
-        )
-        self.acceleration_status = QLabel(
-            "普通模式：最多同时下载 2 个文件；cryptg 本地加速始终启用"
-        )
-        acceleration_row.addWidget(self.acceleration_checkbox)
-        acceleration_row.addWidget(self.acceleration_status, 1)
-        layout.addLayout(acceleration_row)
 
         self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels(
@@ -219,7 +253,6 @@ class DownloadManagerDialog(QDialog):
         self.pause_button.clicked.connect(self.pause_requested.emit)
         self.compression_button.clicked.connect(self._compress_selected)
         self.compression_pause_button.clicked.connect(self.compression_pause_requested.emit)
-        self.acceleration_checkbox.toggled.connect(self.acceleration_requested.emit)
         self.priority_button.clicked.connect(self._prioritize_selected)
         self.cancel_button.clicked.connect(self._cancel_selected)
         self.retry_button.clicked.connect(self._retry_selected)
@@ -353,15 +386,6 @@ class DownloadManagerDialog(QDialog):
         self._paused = paused
         self.pause_button.setText("恢复队列" if paused else "暂停队列")
 
-    def set_acceleration_state(self, enabled: bool, reason: str) -> None:
-        self.acceleration_checkbox.blockSignals(True)
-        self.acceleration_checkbox.setChecked(bool(enabled))
-        self.acceleration_checkbox.blockSignals(False)
-        self.acceleration_status.setText(reason)
-        self.acceleration_status.setStyleSheet(
-            "color: #168443;" if enabled else "color: #666666;"
-        )
-
     def _selected_rows(self) -> list[int]:
         return sorted({index.row() for index in self.table.selectionModel().selectedRows()})
 
@@ -491,9 +515,6 @@ class MainWindow(QMainWindow):
             )
         )
         self.download_manager.pause_requested.connect(self.toggle_pause)
-        self.download_manager.acceleration_requested.connect(
-            lambda enabled: self.worker.submit("set_acceleration_mode", enabled)
-        )
         self.download_manager.notice.connect(self.show_notice)
         self.download_manager.compression_requested.connect(lambda items, profile: self.compression_worker.submit("enqueue_compressions", items, profile))
         self.download_manager.compression_pause_requested.connect(self.toggle_compression_pause)
@@ -517,7 +538,7 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         self.setWindowTitle("Telegram 视频下载器")
-        self.resize(1180, 760)
+        self.resize(1440, 820)
         central = QWidget()
         outer = QVBoxLayout(central)
 
@@ -555,11 +576,27 @@ class MainWindow(QMainWindow):
         outer.addWidget(self.notice_label)
 
         splitter = QSplitter()
+        self.main_splitter = splitter
         left = QWidget()
+        left.setObjectName("chatSidebar")
+        left.setMinimumWidth(300)
         left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(12, 14, 12, 12)
+        left_layout.setSpacing(10)
+        sidebar_heading = QLabel("会话")
+        sidebar_heading.setObjectName("chatSidebarHeading")
+        left_layout.addWidget(sidebar_heading)
+        self.chat_count_label = QLabel("正在读取会话…")
+        self.chat_count_label.setObjectName("chatCountLabel")
+        left_layout.addWidget(self.chat_count_label)
         self.chat_search = QLineEdit()
-        self.chat_search.setPlaceholderText("搜索群聊或频道…")
-        self.chat_list = QListWidget()
+        self.chat_search.setObjectName("chatSearch")
+        self.chat_search.setPlaceholderText("搜索会话名称")
+        self.chat_list = ChatListWidget()
+        self.chat_list.setObjectName("chatList")
+        self.chat_list.setItemDelegate(ChatRowDelegate(self.chat_list))
+        self.chat_list.setSpacing(3)
+        self.chat_list.setMouseTracking(True)
         left_layout.addWidget(self.chat_search)
         left_layout.addWidget(self.chat_list)
         splitter.addWidget(left)
@@ -676,7 +713,18 @@ class MainWindow(QMainWindow):
         self.overall_progress.setFormat("当前任务总体进度 %p%")
         right_layout.addWidget(self.overall_progress)
         splitter.addWidget(right)
-        splitter.setSizes([260, 920])
+        saved_sidebar_width = self.library.get_state("chat_sidebar_width", "350")
+        try:
+            sidebar_width = max(300, min(520, int(saved_sidebar_width)))
+        except ValueError:
+            sidebar_width = 350
+        splitter.setSizes([sidebar_width, 1440 - sidebar_width])
+        self._sidebar_save_timer = QTimer(self)
+        self._sidebar_save_timer.setSingleShot(True)
+        self._sidebar_save_timer.timeout.connect(
+            lambda: self.library.set_state("chat_sidebar_width", str(splitter.sizes()[0]))
+        )
+        splitter.splitterMoved.connect(lambda *_: self._sidebar_save_timer.start(500))
         outer.addWidget(splitter, 1)
         self.setCentralWidget(central)
         self.statusBar().hide()
@@ -762,9 +810,6 @@ class MainWindow(QMainWindow):
         self.worker.download_state.connect(self.update_download_state)
         self.worker.download_job.connect(self.download_manager.add_job)
         self.worker.thumbnail_ready.connect(self.set_video_thumbnail)
-        self.worker.acceleration_changed.connect(
-            self.download_manager.set_acceleration_state
-        )
         self.worker.downloaded_names_ready.connect(self.set_downloaded_names)
         self.worker.connection_changed.connect(self.set_connection)
         self.compression_worker.status.connect(self.show_notice)
@@ -928,13 +973,18 @@ class MainWindow(QMainWindow):
             self.upload_worker.submit("reconcile_local_downloads")
         self.chat_list.blockSignals(True)
         self.chat_list.clear()
+        self.chat_count_label.setText(f"{len(chats)} 个群聊与频道")
         selected_row = -1
         for chat in chats:
-            item = QListWidgetItem(f"{chat['title']}  ·  {chat['kind']}")
+            item = QListWidgetItem(chat["title"])
             item.setData(Qt.UserRole, chat)
+            item.setData(Qt.UserRole + 1, chat["title"])
+            item.setData(Qt.UserRole + 2, chat["kind"])
+            item.setToolTip(f"{chat['title']}\n{chat['kind']}")
             self.chat_list.addItem(item)
             if int(chat["chat_id"]) == selected:
                 selected_row = self.chat_list.count() - 1
+        self.chat_list.resize_rows()
         if selected_row >= 0:
             self.chat_list.setCurrentRow(selected_row)
         self.chat_list.blockSignals(False)
@@ -957,7 +1007,7 @@ class MainWindow(QMainWindow):
         needle = text.casefold().strip()
         for index in range(self.chat_list.count()):
             item = self.chat_list.item(index)
-            item.setHidden(needle not in item.text().casefold())
+            item.setHidden(needle not in str(item.data(Qt.UserRole + 1)).casefold())
 
     def chat_changed(self, current: QListWidgetItem | None, previous: QListWidgetItem | None) -> None:
         del previous

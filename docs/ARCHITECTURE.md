@@ -33,7 +33,7 @@
 2. Telethon 只使用 SOCKS5 代理建立连接。
 3. 历史扫描分别使用 Video、RoundVideo 与 Document 服务端筛选。
 4. 结果以聊天 ID 和消息 ID 去重后逐批写入 SQLite 并发送到界面；重启和切换聊天先读取缓存。
-5. 下载任务写入 `.part`，完成后原子改名并写入 SQLite。
+5. 大文件使用 `parallel_download.py` 经 Telethon 公开的 `iter_download` 同时读取 4 个对齐区段，写入同一 `.part` 的互不重叠区域；小文件使用 `download_media`。仅在区段全部完整后原子改名并写入 SQLite。
 6. 开启自动规则后，新消息事件复用同一媒体识别与下载流程。
 
 切换群聊会取消旧扫描。FloodWait 会保留已有结果并按 Telegram 指示等待。

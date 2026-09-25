@@ -116,11 +116,18 @@ def test_main_window_starts_and_worker_stops(tmp_path: Path) -> None:
     window.download_manager.table.selectRow(0)
     window.download_manager._prioritize_selected()
     assert prioritized[-1] == ([(large_chat_id, video["message_id"])], 0)
-    window.download_manager.set_acceleration_state(True, "安全加速已开启")
-    assert window.download_manager.acceleration_checkbox.isChecked()
-    assert window.download_manager.acceleration_status.text() == "安全加速已开启"
-    window.download_manager.set_acceleration_state(False, "检测到限流，已自动关闭")
-    assert not window.download_manager.acceleration_checkbox.isChecked()
+    assert not hasattr(window.download_manager, "acceleration_checkbox")
+    long_title = "很长的会话名称与详细说明" * 6
+    window.set_chats([{"chat_id": -10012345, "title": long_title, "kind": "频道"}], from_cache=True)
+    app.processEvents()
+    assert window.chat_count_label.text() == "1 个群聊与频道"
+    assert window.chat_list.item(0).sizeHint().height() > 66
+    assert long_title in window.chat_list.item(0).toolTip()
+    window.chat_search.setText("详细说明")
+    assert not window.chat_list.item(0).isHidden()
+    window.chat_search.setText("不存在")
+    assert window.chat_list.item(0).isHidden()
+    window.chat_search.clear()
     target = tmp_path / "target.mp4"
     target.write_bytes(b"downloaded")
     window.download_manager.update_state(large_chat_id, video["message_id"], "completed", str(target))

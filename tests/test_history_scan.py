@@ -206,26 +206,3 @@ def test_download_directory_names_and_priority_queue(tmp_path: Path) -> None:
     assert priority == 0
     assert key == (second["chat_id"], second["message_id"])
     assert version == worker._queue_versions[key]
-
-
-def test_safe_acceleration_can_enable_and_auto_fallback(tmp_path: Path) -> None:
-    paths = make_paths(tmp_path)
-    paths.ensure()
-    worker = TelegramWorker(paths, AppConfig())
-    changes: list[tuple[bool, str]] = []
-    worker.acceleration_changed.connect(
-        lambda enabled, reason: changes.append((enabled, reason))
-    )
-
-    async def scenario() -> None:
-        worker._acceleration_event = asyncio.Event()
-        await worker.set_acceleration_mode(True)
-        assert worker._acceleration_event.is_set()
-        worker._disable_acceleration_after_error(ConnectionError("proxy reset"))
-        assert not worker._acceleration_event.is_set()
-
-    asyncio.run(scenario())
-    assert changes[0][0] is True
-    assert "3 个文件" in changes[0][1]
-    assert changes[-1][0] is False
-    assert "自动关闭" in changes[-1][1]

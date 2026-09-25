@@ -27,6 +27,7 @@ from .library import LibraryStore
 from .credentials import save_api_hash
 from .models import ChatInfo, VideoInfo
 from .naming import choose_video_name, extension_for, sanitize_component, unique_target
+from .parallel_download import PARALLEL_MIN_SIZE, download_document_parallel
 from .paths import AppPaths
 from .proxy import proxy_available
 from .storage import Storage
@@ -52,7 +53,6 @@ class TelegramWorker(QObject):
     download_job = Signal(object)
     download_priority = Signal(object, object, int)
     thumbnail_ready = Signal(int, object, object, object, str)
-    acceleration_changed = Signal(bool, str)
     downloaded_names_ready = Signal(int, object, str)
     connection_changed = Signal(bool, str)
 
@@ -68,8 +68,6 @@ class TelegramWorker(QObject):
         self._phone = ""
         self._queue: asyncio.PriorityQueue | None = None
         self._queue_workers: list[asyncio.Task] = []
-        self._acceleration_enabled = False
-        self._acceleration_event: asyncio.Event | None = None
         self._queue_sequence = 0
         self._queue_versions: dict[tuple[int, int], int] = {}
         self._queued_jobs: dict[tuple[int, int], dict[str, Any]] = {}
@@ -106,9 +104,8 @@ class TelegramWorker(QObject):
         self._queue = asyncio.PriorityQueue()
         self._pause_event = asyncio.Event()
         self._pause_event.set()
-        self._acceleration_event = asyncio.Event()
         self._thumbnail_semaphore = asyncio.Semaphore(2)
-        worker_count = self.config.max_concurrent_downloads + 1
+        worker_count = self.config.max_concurrent_downloads
         self._queue_workers = [
             self.loop.create_task(self._download_worker(index))
             for index in range(worker_count)
@@ -690,42 +687,6 @@ class TelegramWorker(QObject):
             self.download_priority.emit(*key, priority)
         self.status.emit("已更新等待任务的下载优先级。")
 
-    async def set_acceleration_mode(self, enabled: bool) -> None:
-        """Enable one conservative extra file-transfer slot.
-
-        The extra slot improves aggregate throughput for multiple queued files. It
-        deliberately does not split one Telegram file into concurrent requests.
-        """
-        self._acceleration_enabled = bool(enabled)
-        if self._acceleration_event is None:
-            self._acceleration_event = asyncio.Event()
-        if self._acceleration_enabled:
-            self._acceleration_event.set()
-            reason = "安全加速已开启：最多同时下载 3 个文件。"
-        else:
-            self._acceleration_event.clear()
-            reason = "安全加速已关闭：恢复最多同时下载 2 个文件。"
-        LOGGER.info("Download acceleration changed enabled=%s reason=%s", enabled, reason)
-        self.acceleration_changed.emit(self._acceleration_enabled, reason)
-        self.status.emit(reason)
-
-    def _disable_acceleration_after_error(self, exc: BaseException) -> None:
-        if not self._acceleration_enabled or not isinstance(
-            exc, (FloodWaitError, ConnectionError, asyncio.TimeoutError)
-        ):
-            return
-        self._acceleration_enabled = False
-        if self._acceleration_event is not None:
-            self._acceleration_event.clear()
-        if isinstance(exc, FloodWaitError):
-            seconds = int(getattr(exc, "seconds", 0))
-            reason = f"检测到 Telegram 限流（{seconds} 秒），已自动关闭安全加速。"
-        else:
-            reason = "检测到网络连接异常，已自动关闭安全加速。"
-        LOGGER.warning("Download acceleration disabled automatically: %s", reason)
-        self.acceleration_changed.emit(False, reason)
-        self.status.emit(reason)
-
     async def scan_download_directory(self, request_id: int, directory: str) -> None:
         try:
             names = await asyncio.to_thread(self._collect_video_names, Path(directory))
@@ -770,17 +731,10 @@ class TelegramWorker(QObject):
         return names
 
     async def _download_worker(self, worker_id: int) -> None:
-        is_acceleration_worker = worker_id >= self.config.max_concurrent_downloads
+        del worker_id
         while True:
             assert self._queue is not None
-            if is_acceleration_worker:
-                assert self._acceleration_event is not None
-                await self._acceleration_event.wait()
             queue_item = await self._queue.get()
-            if is_acceleration_worker and not self._acceleration_enabled:
-                await self._queue.put(queue_item)
-                self._queue.task_done()
-                continue
             _, _, version, key = queue_item
             job = self._queued_jobs.get(key)
             if not job or self._queue_versions.get(key) != version:
@@ -803,7 +757,6 @@ class TelegramWorker(QObject):
                 self.download_state.emit(*key, "cancelled", "已取消")
             except Exception as exc:
                 LOGGER.exception("Download failed for %s", key)
-                self._disable_acceleration_after_error(exc)
                 if not self.storage.is_downloaded(*key):
                     self.storage.record_download(*key, "", 0, "failed")
                 self.library.update_download_task(*key, "failed", str(exc))
@@ -872,9 +825,18 @@ class TelegramWorker(QObject):
             last_sample_at = now
 
         try:
-            result = await self.client.download_media(message, file=str(part), progress_callback=progress)
-            if not result or not part.exists():
-                raise RuntimeError("Telegram 未返回下载文件。")
+            document = getattr(message, "document", None)
+            size = int(getattr(document, "size", 0) or 0)
+            if document is not None and size >= PARALLEL_MIN_SIZE:
+                await download_document_parallel(
+                    self.client, document, part, size, progress, self._pause_event
+                )
+            else:
+                result = await self.client.download_media(
+                    message, file=str(part), progress_callback=progress
+                )
+                if not result or not part.exists():
+                    raise RuntimeError("Telegram 未返回下载文件。")
             part.replace(target)
         except BaseException:
             with contextlib.suppress(OSError):
